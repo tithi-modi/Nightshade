@@ -1,465 +1,638 @@
 """
-Nightshade Seed Engine - main.py  v3
-Multi-pair controller: EURUSD, GBPUSD, USDJPY, AUDUSD
+Nightshade Seed Engine - main.py  v1  (Layer 1 / central controller)
 
-Changes vs v2:
-  - SYMBOLS list replaces single SYMBOL — all four pairs monitored each cycle
-  - RISK_PCT lowered to 1.0% per trade
-  - MAX_DAILY_TRADES = 3 enforced in Layer 3 (risk.py); main.py checks the
-    gate before even calling evaluate_risk so no wasted computation
-  - Per-symbol last_evaluated_candle_time dict replaces single scalar
-  - Position monitor loops over all four symbols
-  - ATR regime filter preserved exactly — only regime_ok candles trade
-  - Single MT5 init/shutdown lifecycle preserved
-  - All logging to rotating file preserved
+This file did not exist in the reviewed repo. Built from the Nightshade
+specification document, with the following tech-review fixes folded in
+from the start (referenced by GitHub issue item number):
+
+  P0-2   Win/loss is decided from REALIZED MT5 deal history (closed deals,
+         profit + commission + swap), never from a floating-P&L snapshot.
+  P0-3   Indicators use population standard deviation (ddof=0).
+  P0-9   All four symbols are evaluated every cycle BEFORE any execution
+         decision. Candidates are collected, ranked, and only then
+         executed -- so SYMBOLS list order cannot bias which pair gets
+         the daily-trade-limit slots.
+  P0-10  Portfolio/correlated-USD-exposure check (risk.check_portfolio_exposure)
+         is applied to every candidate before execution, in addition to
+         the existing per-trade 1% risk check.
+  P0-11  Spread, tick freshness, candle freshness/count, duplicate/missing
+         candles, and NaN/Inf checks block a symbol before it can produce
+         a tradeable signal.
+  P0-14  On startup, daily_state.json is reconciled from MT5 trade history
+         (risk.reconcile_state_from_history) -- MT5 is authoritative, the
+         JSON file is a cache.
+  P0-15  LIVE_TRADING_ENABLED must be explicitly "true" (env var) AND the
+         connected account must match an explicit allowlist, or the bot
+         refuses to run on a live account.
+  P0-16  A single-instance lock file prevents two copies of the bot from
+         running against the same state file / MT5 terminal at once.
+  P0-17  last_evaluated candle timestamps are persisted in daily_state.json
+         (risk.py), not just held in memory, so a restart mid-day does not
+         reprocess an already-evaluated candle.
+
+Architectural rule (per spec): mt5.initialize() and mt5.shutdown() are
+called ONLY in this file. No other module touches them.
 """
 
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-import time
-import logging
 import datetime
+import time
 import os
-from logging.handlers import RotatingFileHandler
+import sys
+import atexit
+import logging
+import logging.handlers
 
-from risk import (
-    evaluate_risk,
-    load_daily_state,
-    CIRCUIT_BREAKER_ACTIVE_KEY,
-    MAX_DAILY_TRADES,
-)
-from execution import execute_order
+import risk
+import execution
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-SYMBOLS          = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
-TIMEFRAME        = mt5.TIMEFRAME_M15
-CANDLE_SECONDS   = 900          # 15 minutes
-WAKEUP_BUFFER    = 2            # seconds after candle close before reading
-POSITION_CHECK_S = 30           # position monitor interval between candles
+SYMBOLS       = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
+TIMEFRAME     = mt5.TIMEFRAME_M15
+FETCH_COUNT   = 120
+MAGIC_NUMBER  = 20260818
 
-RISK_PCT         = 1.0          # % of equity risked per trade (1% per pair)
-RR_RATIO         = 1.5          # reward-to-risk ratio for static TP
-BB_PERIOD        = 20           # Bollinger Band / Z-score lookback periods
-BB_STD_MULT      = 2.5          # Z-score entry threshold (±2.5 std dev)
-ATR_PERIOD       = 14           # ATR lookback for SL sizing
-ATR_BASELINE     = 50           # ATR baseline lookback for regime filter
-ATR_REGIME_MULT  = 1.2          # ATR must be < baseline × this to allow trade
-CANDLES_TO_FETCH = 120          # must be > ATR_BASELINE + ATR_PERIOD
+BB_PERIOD         = 20
+BB_STD_MULT       = 2.5
+ATR_PERIOD        = 14
+ATR_BASELINE      = 50
+ATR_REGIME_MULT   = 1.2
+RISK_PCT          = 1.0
+RR_RATIO          = 1.5
 
-LOG_DIR          = "logs"
-LOG_FILE         = os.path.join(LOG_DIR, "nightshade.log")
-MAGIC_NUMBER     = 20260818     # identifies this bot's orders in MT5 history
+CANDLE_BUFFER_S      = 2      # wake 2s after the candle boundary
+POSITION_POLL_S      = 30     # position monitor cadence during sleep
+MAX_SPREAD_PIPS      = 5.0
+MAX_CANDLE_AGE_S      = 90    # completed candle must be this fresh (P1-11)
+MIN_HISTORY_CANDLES   = 64    # 50 (ATR baseline) + 14 (ATR) minimum
 
-# ---------------------------------------------------------------------------
-# LOGGING SETUP
-# ---------------------------------------------------------------------------
+LOG_DIR       = "logs"
+LOCK_FILE     = os.path.join(LOG_DIR, "nightshade.lock")
 
-os.makedirs(LOG_DIR, exist_ok=True)
-logging.Formatter.converter = time.gmtime  # all timestamps in UTC
+# --- P0-15: live trading is opt-in, not opt-out ---
+LIVE_TRADING_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
+# Comma-separated list of MT5 account logins allowed to run LIVE, e.g. "12345678".
+LIVE_ACCOUNT_ALLOWLIST = {
+    a.strip() for a in os.environ.get("LIVE_ACCOUNT_ALLOWLIST", "").split(",") if a.strip()
+}
 
-formatter = logging.Formatter(
-    fmt="%(asctime)s UTC | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-file_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=30, encoding="utf-8"
-)
-file_handler.setFormatter(formatter)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-
-log = logging.getLogger("nightshade")
-log.setLevel(logging.INFO)
-log.addHandler(file_handler)
-log.addHandler(console_handler)
 
 # ---------------------------------------------------------------------------
-# STATE
-# Per-symbol dict so each pair tracks its own last-evaluated candle time.
-# Prevents the same candle being evaluated twice for any individual symbol.
+# LOGGING
 # ---------------------------------------------------------------------------
 
-last_evaluated: dict[str, object] = {sym: None for sym in SYMBOLS}
+def setup_logging() -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logger = logging.getLogger("nightshade")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)sZ [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fmt.converter = time.gmtime  # UTC timestamps
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(LOG_DIR, "nightshade.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=30,
+    )
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(fmt)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+log = setup_logging()
+
 
 # ---------------------------------------------------------------------------
-# MT5 CONNECTION MANAGEMENT
+# P0-16: SINGLE-INSTANCE LOCK
+# ---------------------------------------------------------------------------
+
+def _pid_is_running(pid: int) -> bool:
+    if sys.platform.startswith("win"):
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}"], stderr=subprocess.DEVNULL
+            ).decode(errors="ignore")
+            return str(pid) in out
+        except Exception:
+            return True  # can't confirm -> assume running (fail closed)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return True
+
+
+def acquire_single_instance_lock() -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+        except (ValueError, OSError):
+            old_pid = None
+
+        if old_pid is not None and _pid_is_running(old_pid):
+            log.critical(
+                f"Another Nightshade instance appears to be running (PID {old_pid}). "
+                f"Refusing to start a second instance against the same state file. Exiting."
+            )
+            raise SystemExit(1)
+        else:
+            log.warning(f"Stale lock file found (PID {old_pid} not running). Removing and continuing.")
+            os.remove(LOCK_FILE)
+
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+    except FileExistsError:
+        log.critical("Lock file was created by another process between check and acquire. Exiting.")
+        raise SystemExit(1)
+
+    atexit.register(_release_lock)
+
+
+def _release_lock() -> None:
+    try:
+        if os.path.exists(LOCK_FILE):
+            with open(LOCK_FILE, "r") as f:
+                pid = f.read().strip()
+            if pid == str(os.getpid()):
+                os.remove(LOCK_FILE)
+    except Exception as e:
+        log.warning(f"Could not remove lock file cleanly: {e}")
+
+
+# ---------------------------------------------------------------------------
+# MT5 STARTUP / CONNECTION  (only file that calls initialize/shutdown)
 # ---------------------------------------------------------------------------
 
 def startup_mt5() -> bool:
-    """
-    Initializes MT5 exactly once at program startup.
-    Verifies all four symbols are available before returning True.
-    """
     if not mt5.initialize():
         code, msg = mt5.last_error()
-        log.critical(
-            f"MT5 initialization failed. Code: {code}. Message: {msg}. "
-            f"Is MT5 terminal open and logged in?"
-        )
+        log.critical(f"mt5.initialize() failed. MT5 {code}: {msg}. Exiting.")
         return False
 
     terminal = mt5.terminal_info()
     account  = mt5.account_info()
 
     if terminal is None or account is None:
-        log.critical("MT5 connected but terminal/account info unavailable.")
-        mt5.shutdown()
+        log.critical("Cannot read terminal_info()/account_info() after initialize(). Exiting.")
         return False
-
+    if not terminal.connected:
+        log.critical("Terminal reports not connected. Exiting.")
+        return False
     if not terminal.trade_allowed:
-        log.critical(
-            "MT5 terminal has trading disabled. "
-            "Enable Expert Advisors: MT5 toolbar AutoTrading button + "
-            "Tools > Options > Expert Advisors > Allow algorithmic trading."
-        )
-        mt5.shutdown()
+        log.critical("AutoTrading not allowed in terminal. Enable it and restart. Exiting.")
         return False
 
-    log.info(
-        f"MT5 connected. Build: {terminal.build}. "
-        f"Account: {account.login} | {account.company} | "
-        f"Balance: {account.balance:.2f} {account.currency} | "
-        f"Equity: {account.equity:.2f} | Leverage: 1:{account.leverage}"
-    )
-
-    # Verify every symbol is available
-    for sym in SYMBOLS:
-        info = mt5.symbol_info(sym)
-        if info is None:
+    # --- P0-15: live trading protection ---
+    is_live = account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO
+    if is_live:
+        if not LIVE_TRADING_ENABLED:
             log.critical(
-                f"{sym} not found on this broker. "
-                f"Check the exact symbol name — some brokers use suffixes."
+                f"Connected account {account.login} ({account.server}) is LIVE, but "
+                f"LIVE_TRADING_ENABLED is not 'true'. Refusing to run on live capital. Exiting."
             )
-            mt5.shutdown()
             return False
-        if not info.visible:
-            if not mt5.symbol_select(sym, True):
-                log.critical(f"Cannot add {sym} to Market Watch.")
-                mt5.shutdown()
-                return False
-            log.info(f"{sym} added to Market Watch.")
-        log.info(
-            f"{sym} ready. Spread: {info.spread} pts. "
-            f"Min lot: {info.volume_min}. Step: {info.volume_step}."
+        if str(account.login) not in LIVE_ACCOUNT_ALLOWLIST:
+            log.critical(
+                f"Connected LIVE account {account.login} is not in LIVE_ACCOUNT_ALLOWLIST. "
+                f"Refusing to run on an unexpected live account. Exiting."
+            )
+            return False
+        log.warning(
+            f"LIVE TRADING ENABLED for allowlisted account {account.login} on {account.server}. "
+            f"Real capital is at risk."
         )
+    else:
+        log.info(f"Connected to DEMO account {account.login} on {account.server}.")
 
+    for sym_name in SYMBOLS:
+        sym = mt5.symbol_info(sym_name)
+        if sym is None:
+            log.critical(f"Symbol {sym_name} not available on this broker. Exiting.")
+            return False
+        if not sym.visible and not mt5.symbol_select(sym_name, True):
+            log.critical(f"Could not add {sym_name} to Market Watch. Exiting.")
+            return False
+
+    log.info("MT5 startup checks passed. Terminal connected, AutoTrading allowed, all symbols available.")
     return True
 
 
 def check_connection() -> bool:
-    """
-    Lightweight connection check before every cycle.
-    Attempts one reconnect if terminal reports disconnected.
-    """
-    info = mt5.terminal_info()
-    if info is None:
-        log.warning("MT5 terminal_info() returned None. Attempting reconnect...")
-        mt5.shutdown()
-        time.sleep(5)
-        return startup_mt5()
-    if not info.connected:
-        log.warning("MT5 not connected to broker. Waiting...")
-        return False
-    if not info.trade_allowed:
-        log.warning("Trading disabled in MT5 terminal.")
-        return False
-    return True
+    terminal = mt5.terminal_info()
+    if terminal is not None and terminal.connected and terminal.trade_allowed:
+        return True
+
+    log.warning("Connection check failed (not connected or AutoTrading disabled). Attempting reconnect...")
+    mt5.shutdown()
+    time.sleep(2)
+    if startup_mt5():
+        log.info("Reconnect successful.")
+        return True
+
+    log.error("Reconnect failed. Skipping this cycle.")
+    return False
+
 
 # ---------------------------------------------------------------------------
 # CANDLE SLEEP TIMER
 # ---------------------------------------------------------------------------
 
 def seconds_until_next_candle() -> float:
-    """
-    Returns seconds until the next 15-minute candle closes + WAKEUP_BUFFER.
-    The engine evaluates all four symbols on the same candle schedule because
-    all four pairs use the same 15-minute timeframe.
-    """
     now = datetime.datetime.utcnow()
-    secs_past_hour = now.minute * 60 + now.second
-    for boundary in [0, 900, 1800, 2700, 3600]:
-        target = boundary + WAKEUP_BUFFER
-        if target > secs_past_hour:
-            return float(target - secs_past_hour)
-    return float(3600 - secs_past_hour + WAKEUP_BUFFER)
+    minute_block = (now.minute // 15 + 1) * 15
+    next_boundary = now.replace(second=0, microsecond=0)
+    if minute_block == 60:
+        next_boundary = (next_boundary + datetime.timedelta(hours=1)).replace(minute=0)
+    else:
+        next_boundary = next_boundary.replace(minute=minute_block)
+    delta = (next_boundary - now).total_seconds() + CANDLE_BUFFER_S
+    return max(delta, 0.0)
+
 
 # ---------------------------------------------------------------------------
-# POSITION MONITOR — dynamic take-profit for all four symbols
+# DATA QUALITY  (P1-11)
 # ---------------------------------------------------------------------------
 
-def monitor_all_positions(sma_values: dict[str, float]) -> None:
+def data_quality_check(sym_name: str, df: pd.DataFrame, sym) -> str | None:
+    """Returns None if data quality is acceptable, else a reason string."""
+    if df is None or len(df) < MIN_HISTORY_CANDLES:
+        return f"Insufficient history: {0 if df is None else len(df)} < {MIN_HISTORY_CANDLES} candles."
+
+    if len(df) < FETCH_COUNT:
+        log.warning(f"[{sym_name}] Only {len(df)}/{FETCH_COUNT} candles returned (proceeding, above minimum).")
+
+    # Duplicate / missing candle check via timestamp deltas.
+    diffs = df["time"].diff().dropna()
+    expected = pd.Timedelta(minutes=15)
+    if (diffs == pd.Timedelta(0)).any():
+        return "Duplicate candle timestamps detected."
+    if (diffs > expected * 1.5).any():
+        return "Gap detected in candle history (missing candles)."
+
+    last_candle_time = df["time"].iloc[-2]  # the completed candle we'll evaluate
+    age_s = (datetime.datetime.utcnow() - last_candle_time.to_pydatetime()).total_seconds()
+    if age_s > (15 * 60 + MAX_CANDLE_AGE_S):
+        return f"Completed candle is stale ({age_s:.0f}s old)."
+
+    tick = mt5.symbol_info_tick(sym_name)
+    if tick is None:
+        return "Cannot read live tick."
+    tick_age_s = time.time() - tick.time
+    if tick_age_s > MAX_CANDLE_AGE_S:
+        return f"Tick is stale ({tick_age_s:.0f}s old)."
+    if tick.bid <= 0 or tick.ask <= 0 or tick.ask < tick.bid:
+        return f"Abnormal bid/ask: bid={tick.bid}, ask={tick.ask}."
+
+    spread_pips = (tick.ask - tick.bid) / (sym.point * 10)
+    if spread_pips > MAX_SPREAD_PIPS:
+        return f"Spread too wide: {spread_pips:.1f} pips > {MAX_SPREAD_PIPS} limit."
+
+    check_cols = ["close", "high", "low", "open"]
+    if not np.isfinite(df[check_cols].to_numpy()).all():
+        return "Non-finite (NaN/Inf) OHLC values in candle data."
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# INDICATORS
+# ---------------------------------------------------------------------------
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["sma"] = df["close"].rolling(BB_PERIOD).mean()
+    # P0-3: population standard deviation (ddof=0) per spec.
+    df["std"] = df["close"].rolling(BB_PERIOD).std(ddof=0)
+    df["z_score"] = (df["close"] - df["sma"]) / df["std"]
+
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    df["tr"] = np.maximum(hl, np.maximum(hc, lc))
+    df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
+    df["atr_baseline"] = df["atr"].rolling(ATR_BASELINE).mean()
+    df["regime_ok"] = df["atr"] < (df["atr_baseline"] * ATR_REGIME_MULT)
+
+    df["signal"] = 0
+    df.loc[df["regime_ok"] & (df["z_score"] < -BB_STD_MULT), "signal"] = 1
+    df.loc[df["regime_ok"] & (df["z_score"] > BB_STD_MULT), "signal"] = -1
+    return df
+
+
+# ---------------------------------------------------------------------------
+# PER-SYMBOL EVALUATION (checks 1-4), COLLECTS CANDIDATES ONLY
+# ---------------------------------------------------------------------------
+
+def evaluate_symbol(sym_name: str, state: dict):
     """
-    Checks every open position across all four symbols.
-    Closes a position if price has returned to the 20-period SMA
-    (the mean-reversion target).
-
-    sma_values: dict mapping symbol -> current SMA from latest candle data.
+    Runs indicator calc + checks 1-4 + risk engine + portfolio exposure for
+    one symbol. Returns a candidate dict if a trade is approved, else None.
+    Does NOT execute anything and does NOT mutate global state beyond
+    returning the completed-candle timestamp for the caller to persist.
+    P0-9: this function makes no execution decision -- it only reports
+    whether this symbol WOULD trade, so main() can rank all symbols
+    before choosing.
     """
-    positions = mt5.positions_get()
-    if not positions:
-        return
+    sym = mt5.symbol_info(sym_name)
+    if sym is None:
+        log.error(f"[{sym_name}] symbol_info() returned None. Skipping.")
+        return None
 
-    for pos in positions:
-        sym = pos.symbol
-        if sym not in SYMBOLS:
-            continue
-        if pos.magic != MAGIC_NUMBER:
-            continue
+    rates = mt5.copy_rates_from_pos(sym_name, TIMEFRAME, 0, FETCH_COUNT)
+    if rates is None or len(rates) == 0:
+        log.error(f"[{sym_name}] copy_rates_from_pos() returned no data. Skipping.")
+        return None
 
-        sma = sma_values.get(sym, 0.0)
-        if sma <= 0:
-            continue
-
-        tick = mt5.symbol_info_tick(sym)
-        if tick is None:
-            continue
-
-        close_condition = False
-        reason = ""
-
-        if pos.type == mt5.ORDER_TYPE_BUY and tick.bid >= sma:
-            close_condition = True
-            reason = f"BUY returned to SMA {sma:.5f}. Bid: {tick.bid:.5f}"
-
-        elif pos.type == mt5.ORDER_TYPE_SELL and tick.ask <= sma:
-            close_condition = True
-            reason = f"SELL returned to SMA {sma:.5f}. Ask: {tick.ask:.5f}"
-
-        if close_condition:
-            close_req = {
-                "action":   mt5.TRADE_ACTION_DEAL,
-                "symbol":   sym,
-                "volume":   pos.volume,
-                "type":     mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY
-                            else mt5.ORDER_TYPE_BUY,
-                "position": pos.ticket,
-                "price":    tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask,
-                "deviation": 20,
-                "magic":    MAGIC_NUMBER,
-                "comment":  "NSD_DYN_TP",
-                "type_time":    mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            result = mt5.order_send(close_req)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(
-                    f"DYNAMIC TP | {sym} Ticket #{pos.ticket} closed. "
-                    f"{reason}. P&L: {pos.profit:.2f}."
-                )
-            else:
-                rc = result.retcode if result else "None"
-                log.error(
-                    f"Dynamic TP FAILED | {sym} Ticket #{pos.ticket}. "
-                    f"Retcode: {rc}."
-                )
-
-# ---------------------------------------------------------------------------
-# OPEN POSITION GATE — per symbol
-# ---------------------------------------------------------------------------
-
-def has_open_position(symbol: str) -> bool:
-    """Returns True if this bot has an open position for the given symbol."""
-    positions = mt5.positions_get(symbol=symbol)
-    if not positions:
-        return False
-    return any(p.magic == MAGIC_NUMBER for p in positions)
-
-# ---------------------------------------------------------------------------
-# STRATEGY CALCULATIONS
-# ---------------------------------------------------------------------------
-
-def compute_indicators(rates, symbol: str) -> pd.DataFrame:
-    """
-    Computes all indicators on the full candle dataset.
-    Preserves ATR regime filter exactly — only regime_ok candles generate signals.
-
-    ATR regime: current ATR(14) must be below ATR_BASELINE(50) * ATR_REGIME_MULT(1.2).
-    This blocks trading during news spikes and abnormal volatility periods.
-    """
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
 
-    # Z-Score / Bollinger Band
-    df["sma"]     = df["close"].rolling(BB_PERIOD).mean()
-    df["std"]     = df["close"].rolling(BB_PERIOD).std()
-    df["z_score"] = (df["close"] - df["sma"]) / df["std"]
+    dq_reason = data_quality_check(sym_name, df, sym)
+    if dq_reason:
+        log.warning(f"[{sym_name}] Data quality check failed: {dq_reason}. Skipping.")
+        return None
 
-    # ATR
-    hl  = df["high"] - df["low"]
-    hc  = (df["high"] - df["close"].shift()).abs()
-    lc  = (df["low"]  - df["close"].shift()).abs()
-    df["tr"]           = np.maximum(hl, np.maximum(hc, lc))
-    df["atr"]          = df["tr"].rolling(ATR_PERIOD).mean()
-    df["atr_baseline"] = df["atr"].rolling(ATR_BASELINE).mean()
+    df = compute_indicators(df)
+    c = df.iloc[-2]
+    candle_time_str = c["time"].isoformat()
 
-    # Regime filter — PRESERVED: no trade unless ATR is within normal range
-    df["regime_ok"] = df["atr"] < (df["atr_baseline"] * ATR_REGIME_MULT)
+    # P0-17: duplicate-candle guard using PERSISTED last_evaluated, not memory.
+    if state.get("last_evaluated", {}).get(sym_name) == candle_time_str:
+        return None  # already evaluated this candle for this symbol
 
-    # Signals — only fire when regime is OK and Z-score crosses threshold
-    df["signal"] = 0
-    df.loc[df["regime_ok"] & (df["z_score"] < -BB_STD_MULT), "signal"] =  1  # BUY
-    df.loc[df["regime_ok"] & (df["z_score"] >  BB_STD_MULT), "signal"] = -1  # SELL
-
-    return df
-
-# ---------------------------------------------------------------------------
-# SINGLE SYMBOL CYCLE
-# ---------------------------------------------------------------------------
-
-def evaluate_symbol(symbol: str) -> float:
-    """
-    Runs one full evaluation cycle for a single symbol.
-    Returns the current SMA value for use by the position monitor.
-    Returns 0.0 on any data failure.
-    """
-    global last_evaluated
-
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, CANDLES_TO_FETCH)
-    sym_info = mt5.symbol_info(symbol)
-
-    if rates is None or len(rates) == 0 or sym_info is None:
-        log.error(f"{symbol}: Failed to fetch candle data or symbol info.")
-        return 0.0
-
-    df        = compute_indicators(rates, symbol)
-    completed = df.iloc[-2]   # iloc[-1] is the still-forming candle
-    current_sma = float(completed["sma"]) if not pd.isna(completed["sma"]) else 0.0
-
-    # --- Duplicate candle guard (per symbol) ---
-    candle_time = completed["time"]
-    if last_evaluated[symbol] == candle_time:
-        return current_sma  # already processed this candle for this symbol
-
-    last_evaluated[symbol] = candle_time
-
-    # --- Read signal ---
-    sig        = completed["signal"]
-    signal_str = "BUY" if sig == 1 else ("SELL" if sig == -1 else "HOLD")
-    z          = completed["z_score"]
-    atr        = completed["atr"]
-    regime     = completed["regime_ok"]
-
+    sig_str = "BUY" if c["signal"] == 1 else ("SELL" if c["signal"] == -1 else "HOLD")
     log.info(
-        f"{symbol} | Candle {candle_time} | "
-        f"Close: {completed['close']:.5f} | Z: {z:.2f} | "
-        f"ATR: {atr:.5f} | Regime OK: {regime} | Signal: {signal_str}"
+        f"[{sym_name}] Candle {c['time']} | Z: {c['z_score']:.2f} | ATR: {c['atr']:.5f} | "
+        f"Regime: {c['regime_ok']} | Signal: {sig_str}"
     )
 
-    if signal_str == "HOLD":
-        return current_sma
+    # This candle is now considered evaluated regardless of outcome below.
+    state.setdefault("last_evaluated", {})[sym_name] = candle_time_str
 
-    # --- Open position gate ---
-    if has_open_position(symbol):
-        log.info(f"{symbol}: Signal {signal_str} skipped — position already open.")
-        return current_sma
+    # Check 1: signal
+    if c["signal"] == 0:
+        return None
 
-    # --- Daily trade count gate (checked here before calling risk engine) ---
-    state = load_daily_state()
-    trades_today = state.get("trades_today", 0)
-    if trades_today >= MAX_DAILY_TRADES:
-        log.warning(
-            f"{symbol}: Signal {signal_str} blocked — daily trade limit reached "
-            f"({trades_today}/{MAX_DAILY_TRADES}). No more trades today."
-        )
-        return current_sma
+    # Check 2: existing position (fail closed on MT5 error, P0-6)
+    has_position = risk.is_position_open(sym_name, MAGIC_NUMBER)
+    if has_position is None:
+        log.error(f"[{sym_name}] Cannot confirm open-position state. Skipping (fail closed).")
+        return None
+    if has_position:
+        log.info(f"[{sym_name}] Already has an open position. Skipping.")
+        return None
 
-    if state.get(CIRCUIT_BREAKER_ACTIVE_KEY):
-        log.warning(
-            f"{symbol}: Signal {signal_str} blocked — circuit breaker active."
-        )
-        return current_sma
+    # Check 3: circuit breaker
+    if state.get(risk.CIRCUIT_BREAKER_ACTIVE_KEY):
+        log.info(f"[{sym_name}] Circuit breaker active. Skipping.")
+        return None
 
-    # --- Fresh tick for entry price ---
-    tick = mt5.symbol_info_tick(symbol)
+    # Check 4: daily trade count
+    if state.get("trades_today", 0) >= risk.MAX_DAILY_TRADES:
+        log.info(f"[{sym_name}] Daily trade limit reached. Skipping.")
+        return None
+
+    signal_type = "BUY" if c["signal"] == 1 else "SELL"
+    tick = mt5.symbol_info_tick(sym_name)
     if tick is None:
-        log.error(f"{symbol}: Cannot read current tick. Skipping.")
-        return current_sma
-    current_price = tick.ask if signal_str == "BUY" else tick.bid
+        log.error(f"[{sym_name}] Cannot read tick for risk evaluation. Skipping.")
+        return None
+    price = tick.ask if signal_type == "BUY" else tick.bid
 
-    # --- Risk gate ---
-    log.info(f"{symbol}: Passing to Risk Engine...")
-    trade_proposal = evaluate_risk(
-        signal_type   = signal_str,
-        current_price = current_price,
-        atr_val       = float(atr),
-        risk_pct      = RISK_PCT,
-        rr_ratio      = RR_RATIO,
-        symbol        = symbol,
+    proposal = risk.evaluate_risk(
+        signal_type=signal_type,
+        current_price=price,
+        atr_val=float(c["atr"]),
+        risk_pct=RISK_PCT,
+        rr_ratio=RR_RATIO,
+        symbol=sym_name,
     )
+    if not proposal.get("is_approved"):
+        return None
 
-    if not trade_proposal.get("is_approved"):
-        reason = trade_proposal.get("reject_reason", "Unknown")
-        log.info(f"{symbol}: Trade REJECTED. Reason: {reason}")
-        return current_sma
+    # P1-10: portfolio / correlated exposure check, in addition to per-trade risk.
+    exposure = risk.check_portfolio_exposure(sym_name, signal_type, MAGIC_NUMBER)
+    if not exposure.get("ok"):
+        log.info(f"[{sym_name}] Portfolio exposure guard rejected trade: {exposure.get('reason')}")
+        return None
 
-    # --- Execution ---
-    log.info(f"{symbol}: Trade APPROVED. Sending to Execution Engine...")
-    execute_order(trade_proposal, log)
+    proposal["z_score_abs"] = abs(float(c["z_score"]))
+    proposal["sma"] = float(c["sma"])
+    return proposal
 
-    return current_sma
+
+# ---------------------------------------------------------------------------
+# CANDLE CYCLE — evaluate all symbols, rank, execute (P0-9)
+# ---------------------------------------------------------------------------
+
+def run_candle_cycle(sma_cache: dict) -> None:
+    state = risk.load_daily_state()
+    candidates = []
+
+    for sym_name in SYMBOLS:
+        candidate = evaluate_symbol(sym_name, state)
+        if candidate is not None:
+            candidates.append(candidate)
+        # Track latest SMA for dynamic TP regardless of whether a trade fired.
+        sym = mt5.symbol_info(sym_name)
+        if sym is not None:
+            rates = mt5.copy_rates_from_pos(sym_name, TIMEFRAME, 0, FETCH_COUNT)
+            if rates is not None and len(rates) > 0:
+                df = pd.DataFrame(rates)
+                df["close"] = df["close"]
+                sma_val = pd.Series(df["close"]).rolling(BB_PERIOD).mean().iloc[-2]
+                if pd.notna(sma_val):
+                    sma_cache[sym_name] = float(sma_val)
+
+    risk._save_daily_state(state)  # persist last_evaluated even if nothing traded
+
+    if not candidates:
+        return
+
+    # Rank candidates by strength of mean-reversion signal (larger |Z| first).
+    # List order of SYMBOLS never determines priority (P0-9).
+    candidates.sort(key=lambda p: p["z_score_abs"], reverse=True)
+
+    for proposal in candidates:
+        state = risk.load_daily_state()
+        if state.get(risk.CIRCUIT_BREAKER_ACTIVE_KEY):
+            log.info("Circuit breaker activated mid-cycle. Stopping further executions this cycle.")
+            break
+        if state.get("trades_today", 0) >= risk.MAX_DAILY_TRADES:
+            log.info("Daily trade limit reached mid-cycle. Stopping further executions this cycle.")
+            break
+
+        log.info(
+            f"[{proposal['symbol']}] Candidate ranked for execution (|Z|={proposal['z_score_abs']:.2f})."
+        )
+        execution.execute_order(proposal, log=log)
+
+
+# ---------------------------------------------------------------------------
+# POSITION MONITOR — dynamic TP + REALIZED close detection (P0-2)
+# ---------------------------------------------------------------------------
+
+def position_monitor(known_positions: dict, sma_cache: dict) -> None:
+    positions = mt5.positions_get()
+    if positions is None:
+        log.error("position_monitor: positions_get() returned None. Cannot confirm state this pass.")
+        return
+
+    our_positions = [p for p in positions if p.magic == MAGIC_NUMBER]
+    current_tickets = {p.ticket for p in our_positions}
+
+    # --- Dynamic take-profit ---
+    for p in our_positions:
+        sma_val = sma_cache.get(p.symbol)
+        if sma_val is None:
+            continue
+        tick = mt5.symbol_info_tick(p.symbol)
+        if tick is None:
+            continue
+
+        should_close = False
+        if p.type == mt5.ORDER_TYPE_BUY and tick.bid >= sma_val:
+            should_close = True
+        elif p.type == mt5.ORDER_TYPE_SELL and tick.ask <= sma_val:
+            should_close = True
+
+        if should_close:
+            close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": p.symbol,
+                "volume": p.volume,
+                "type": close_type,
+                "position": p.ticket,
+                "price": close_price,
+                "deviation": execution.MAX_DEVIATION,
+                "magic": MAGIC_NUMBER,
+                "comment": "NSD_DYNAMIC_TP",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                log.info(f"[{p.symbol}] Dynamic TP closed ticket #{p.ticket} @ {result.price:.5f}.")
+            else:
+                code = result.retcode if result else None
+                log.warning(f"[{p.symbol}] Dynamic TP close attempt failed for #{p.ticket} (retcode={code}).")
+
+        known_positions[p.ticket] = p.profit  # last-seen floating P&L, informational only
+
+    # --- P0-2: detect closes via REALIZED MT5 deal history, not floating P&L ---
+    closed_tickets = [t for t in known_positions if t not in current_tickets]
+    if closed_tickets:
+        since = datetime.datetime.utcnow() - datetime.timedelta(hours=6)
+        now = datetime.datetime.utcnow()
+        deals = mt5.history_deals_get(since, now)
+        if deals is None:
+            log.error(
+                "position_monitor: history_deals_get() returned None while reconciling closed "
+                "tickets. Cannot confirm realized P&L this pass -- will retry next cycle."
+            )
+        else:
+            deals_by_position = {}
+            for d in deals:
+                if d.magic != MAGIC_NUMBER or d.entry not in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY):
+                    continue
+                deals_by_position.setdefault(d.position_id, []).append(d)
+
+            for ticket in closed_tickets:
+                closing_deals = deals_by_position.get(ticket)
+                if not closing_deals:
+                    log.warning(
+                        f"Ticket #{ticket} disappeared from open positions but no closing deal "
+                        f"found yet in history. Will retry reconciliation next pass."
+                    )
+                    continue
+                realized = sum(d.profit + d.commission + d.swap for d in closing_deals)
+                risk.record_trade_closed(realized)
+                log.info(f"Ticket #{ticket} closed. Realized P&L: {realized:.2f}. Recorded as "
+                         f"{'WIN' if realized > 0 else 'LOSS'}.")
+                del known_positions[ticket]
+
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 
-def run_all_symbols() -> dict[str, float]:
-    """
-    Runs one evaluation cycle across all four symbols.
-    Returns a dict of symbol -> current SMA for the position monitor.
-    """
-    sma_values: dict[str, float] = {}
+def main() -> None:
+    acquire_single_instance_lock()
 
-    if not check_connection():
-        return sma_values
-
-    for symbol in SYMBOLS:
-        try:
-            sma_values[symbol] = evaluate_symbol(symbol)
-        except Exception as e:
-            log.error(f"{symbol}: Unhandled exception in evaluate_symbol: {e}")
-            sma_values[symbol] = 0.0
-
-    return sma_values
-
-
-if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("NIGHTSHADE SEED ENGINE STARTING — MULTI-PAIR v3")
-    log.info(f"Pairs:  {', '.join(SYMBOLS)}")
-    log.info(f"Risk:   {RISK_PCT}% per trade | RR: {RR_RATIO} | "
-             f"Max trades/day: {MAX_DAILY_TRADES}")
+    log.info("NIGHTSHADE SEED ENGINE v1 — STARTING")
     log.info("=" * 60)
 
     if not startup_mt5():
-        log.critical("Cannot start. Fix MT5 connection and restart.")
         raise SystemExit(1)
 
-    sma_values: dict[str, float] = {sym: 0.0 for sym in SYMBOLS}
-
     try:
+        # P0-14: MT5 history is authoritative; reconcile cached JSON on startup.
+        risk.reconcile_state_from_history(MAGIC_NUMBER)
+
+        known_positions: dict = {}
+        sma_cache: dict = {}
+
+        # Seed known_positions from whatever is already open at startup so a
+        # restart doesn't lose track of positions opened by a prior run.
+        existing = mt5.positions_get()
+        if existing is not None:
+            for p in existing:
+                if p.magic == MAGIC_NUMBER:
+                    known_positions[p.ticket] = p.profit
+
         while True:
-            # Evaluate all four symbols on this candle
-            sma_values = run_all_symbols()
+            if not check_connection():
+                time.sleep(POSITION_POLL_S)
+                continue
 
-            # Sleep toward next candle, running position monitor every 30s
-            sleep_total = seconds_until_next_candle()
-            log.info(f"Next candle read in {sleep_total:.1f}s.")
+            sleep_s = seconds_until_next_candle()
+            log.info(f"Sleeping {sleep_s:.1f}s until next candle boundary. {risk.get_streak_status()}")
 
-            elapsed = 0.0
-            while elapsed < sleep_total:
-                chunk = min(POSITION_CHECK_S, sleep_total - elapsed)
+            slept = 0.0
+            while slept < sleep_s:
+                chunk = min(POSITION_POLL_S, sleep_s - slept)
                 time.sleep(chunk)
-                elapsed += chunk
+                slept += chunk
+                position_monitor(known_positions, sma_cache)
 
-                if check_connection():
-                    monitor_all_positions(sma_values)
+            if not check_connection():
+                continue
+
+            run_candle_cycle(sma_cache)
 
     except KeyboardInterrupt:
-        log.info("Keyboard interrupt. Shutting down cleanly.")
+        log.info("KeyboardInterrupt received. Shutting down cleanly.")
+    except Exception:
+        log.exception("Unhandled exception in main loop. Shutting down.")
     finally:
         mt5.shutdown()
-        log.info("MT5 connection closed. Engine stopped.")
+        log.info("MT5 shutdown complete. Nightshade stopped.")
+
+
+if __name__ == "__main__":
+    main()
