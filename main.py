@@ -1,5 +1,5 @@
 """
-Nightshade Seed Engine - main.py  v1  (Layer 1 / central controller)
+Nightshade Seed Engine - main.py  v6  (Layer 1 / central controller)
 
 This file did not exist in the reviewed repo. Built from the Nightshade
 specification document, with the following tech-review fixes folded in
@@ -44,6 +44,7 @@ import sys
 import atexit
 import logging
 import logging.handlers
+from pathlib import Path
 
 import risk
 import execution
@@ -71,8 +72,9 @@ MAX_SPREAD_PIPS      = 5.0
 MAX_CANDLE_AGE_S      = 90    # completed candle must be this fresh (P1-11)
 MIN_HISTORY_CANDLES   = 64    # 50 (ATR baseline) + 14 (ATR) minimum
 
-LOG_DIR       = "logs"
-LOCK_FILE     = os.path.join(LOG_DIR, "nightshade.lock")
+BASE_DIR       = Path(__file__).resolve().parent
+LOG_DIR        = BASE_DIR / "logs"
+LOCK_FILE      = LOG_DIR / "nightshade.lock"
 
 # --- P0-15: live trading is opt-in, not opt-out ---
 LIVE_TRADING_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
@@ -80,6 +82,8 @@ LIVE_TRADING_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().l
 LIVE_ACCOUNT_ALLOWLIST = {
     a.strip() for a in os.environ.get("LIVE_ACCOUNT_ALLOWLIST", "").split(",") if a.strip()
 }
+LIVE_BROKER_ALLOWLIST = {a.strip() for a in os.environ.get("LIVE_BROKER_ALLOWLIST", "").split(",") if a.strip()}
+LIVE_SERVER_ALLOWLIST = {a.strip() for a in os.environ.get("LIVE_SERVER_ALLOWLIST", "").split(",") if a.strip()}
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +91,7 @@ LIVE_ACCOUNT_ALLOWLIST = {
 # ---------------------------------------------------------------------------
 
 def setup_logging() -> logging.Logger:
-    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("nightshade")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -99,7 +103,7 @@ def setup_logging() -> logging.Logger:
     fmt.converter = time.gmtime  # UTC timestamps
 
     file_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(LOG_DIR, "nightshade.log"),
+        LOG_DIR / "nightshade.log",
         maxBytes=10 * 1024 * 1024,
         backupCount=30,
     )
@@ -220,6 +224,12 @@ def startup_mt5() -> bool:
                 f"Refusing to run on an unexpected live account. Exiting."
             )
             return False
+        if not LIVE_BROKER_ALLOWLIST or account.company not in LIVE_BROKER_ALLOWLIST:
+            log.critical("Live broker is not explicitly allowlisted. Refusing to run.")
+            return False
+        if not LIVE_SERVER_ALLOWLIST or account.server not in LIVE_SERVER_ALLOWLIST:
+            log.critical("Live server is not explicitly allowlisted. Refusing to run.")
+            return False
         log.warning(
             f"LIVE TRADING ENABLED for allowlisted account {account.login} on {account.server}. "
             f"Real capital is at risk."
@@ -261,7 +271,7 @@ def check_connection() -> bool:
 # ---------------------------------------------------------------------------
 
 def seconds_until_next_candle() -> float:
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     minute_block = (now.minute // 15 + 1) * 15
     next_boundary = now.replace(second=0, microsecond=0)
     if minute_block == 60:
@@ -284,16 +294,39 @@ def data_quality_check(sym_name: str, df: pd.DataFrame, sym) -> str | None:
     if len(df) < FETCH_COUNT:
         log.warning(f"[{sym_name}] Only {len(df)}/{FETCH_COUNT} candles returned (proceeding, above minimum).")
 
-    # Duplicate / missing candle check via timestamp deltas.
-    diffs = df["time"].diff().dropna()
-    expected = pd.Timedelta(minutes=15)
+    # Sort chronologically to inspect candle deltas
+    df_sorted = df.sort_values("time").reset_index(drop=True)
+    diffs = df_sorted["time"].diff().dropna()
+    expected_interval = pd.Timedelta(minutes=15)
+
+    # 1. Duplicate timestamp check
     if (diffs == pd.Timedelta(0)).any():
         return "Duplicate candle timestamps detected."
-    if (diffs > expected * 1.5).any():
-        return "Gap detected in candle history (missing candles)."
+
+    # 2. Gap analysis (> 1.5x expected interval)
+    gap_indices = diffs[diffs > (expected_interval * 1.5)].index
+
+    for idx in gap_indices:
+        gap_start = df_sorted.loc[idx - 1, "time"]
+        gap_end = df_sorted.loc[idx, "time"]
+        gap_duration = gap_end - gap_start
+
+        # Validate whether the gap represents a standard weekend closure:
+        # - Starts on Friday (4) or Saturday (5)
+        # - Ends on Sunday (6) or Monday (0)
+        # - Total duration is between 40 and 72 hours
+        is_weekend_start = gap_start.dayofweek in (4, 5)
+        is_weekend_end = gap_end.dayofweek in (6, 0)
+        is_weekend_duration = pd.Timedelta(hours=40) <= gap_duration <= pd.Timedelta(hours=72)
+
+        is_valid_weekend_gap = is_weekend_start and is_weekend_end and is_weekend_duration
+
+        if not is_valid_weekend_gap:
+            return f"Mid-week gap detected ({gap_duration} between {gap_start} and {gap_end})."
 
     last_candle_time = df["time"].iloc[-2]  # the completed candle we'll evaluate
-    age_s = (datetime.datetime.utcnow() - last_candle_time.to_pydatetime()).total_seconds()
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    age_s = (now_utc - last_candle_time.to_pydatetime()).total_seconds()
     if age_s > (15 * 60 + MAX_CANDLE_AGE_S):
         return f"Completed candle is stale ({age_s:.0f}s old)."
 
@@ -322,24 +355,7 @@ def data_quality_check(sym_name: str, df: pd.DataFrame, sym) -> str | None:
 # ---------------------------------------------------------------------------
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["sma"] = df["close"].rolling(BB_PERIOD).mean()
-    # P0-3: population standard deviation (ddof=0) per spec.
-    df["std"] = df["close"].rolling(BB_PERIOD).std(ddof=0)
-    df["z_score"] = (df["close"] - df["sma"]) / df["std"]
-
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    df["tr"] = np.maximum(hl, np.maximum(hc, lc))
-    df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
-    df["atr_baseline"] = df["atr"].rolling(ATR_BASELINE).mean()
-    df["regime_ok"] = df["atr"] < (df["atr_baseline"] * ATR_REGIME_MULT)
-
-    df["signal"] = 0
-    df.loc[df["regime_ok"] & (df["z_score"] < -BB_STD_MULT), "signal"] = 1
-    df.loc[df["regime_ok"] & (df["z_score"] > BB_STD_MULT), "signal"] = -1
-    return df
+    return risk.compute_indicators(df, BB_PERIOD, ATR_PERIOD, ATR_BASELINE, BB_STD_MULT, ATR_REGIME_MULT)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +392,10 @@ def evaluate_symbol(sym_name: str, state: dict):
 
     df = compute_indicators(df)
     c = df.iloc[-2]
+    indicator_cols = ["sma", "std", "z_score", "atr", "atr_baseline"]
+    if not np.isfinite(c[indicator_cols].to_numpy(dtype=float)).all():
+        log.warning(f"[{sym_name}] Completed candle has non-finite indicators. Skipping.")
+        return None
     candle_time_str = c["time"].isoformat()
 
     # P0-17: duplicate-candle guard using PERSISTED last_evaluated, not memory.
@@ -433,12 +453,13 @@ def evaluate_symbol(sym_name: str, state: dict):
         return None
 
     # P1-10: portfolio / correlated exposure check, in addition to per-trade risk.
-    exposure = risk.check_portfolio_exposure(sym_name, signal_type, MAGIC_NUMBER)
+    exposure = risk.check_portfolio_exposure(sym_name, signal_type, MAGIC_NUMBER, RISK_PCT)
     if not exposure.get("ok"):
         log.info(f"[{sym_name}] Portfolio exposure guard rejected trade: {exposure.get('reason')}")
         return None
 
     proposal["z_score_abs"] = abs(float(c["z_score"]))
+    proposal["spread_pips"] = (tick.ask - tick.bid) / (sym.point * 10)
     proposal["sma"] = float(c["sma"])
     return proposal
 
@@ -466,14 +487,19 @@ def run_candle_cycle(sma_cache: dict) -> None:
                 if pd.notna(sma_val):
                     sma_cache[sym_name] = float(sma_val)
 
-    risk._save_daily_state(state)  # persist last_evaluated even if nothing traded
+    # Reload before persisting our candle markers so a state update made by
+    # evaluate_risk() (for example start_equity) is never overwritten.
+    newest_state = risk.load_daily_state()
+    newest_state.setdefault("last_evaluated", {}).update(state.get("last_evaluated", {}))
+    risk._save_daily_state(newest_state)
 
     if not candidates:
         return
 
     # Rank candidates by strength of mean-reversion signal (larger |Z| first).
     # List order of SYMBOLS never determines priority (P0-9).
-    candidates.sort(key=lambda p: p["z_score_abs"], reverse=True)
+    # Deterministic data-based tie breaker: lower current spread first.
+    candidates.sort(key=lambda p: (-p["z_score_abs"], p.get("spread_pips", float("inf"))))
 
     for proposal in candidates:
         state = risk.load_daily_state()
@@ -484,6 +510,12 @@ def run_candle_cycle(sma_cache: dict) -> None:
             log.info("Daily trade limit reached mid-cycle. Stopping further executions this cycle.")
             break
 
+        # Re-read the portfolio immediately before every order; earlier fills
+        # must change the decision for later candidates.
+        exposure = risk.check_portfolio_exposure(proposal["symbol"], proposal["signal"], MAGIC_NUMBER, RISK_PCT)
+        if not exposure.get("ok"):
+            log.info(f"[{proposal['symbol']}] Portfolio exposure changed: {exposure.get('reason')}")
+            continue
         log.info(
             f"[{proposal['symbol']}] Candidate ranked for execution (|Z|={proposal['z_score_abs']:.2f})."
         )
@@ -532,7 +564,7 @@ def position_monitor(known_positions: dict, sma_cache: dict) -> None:
                 "magic": MAGIC_NUMBER,
                 "comment": "NSD_DYNAMIC_TP",
                 "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
+                "type_filling": execution._supported_filling_mode(mt5.symbol_info(p.symbol)),
             }
             result = mt5.order_send(request)
             if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -546,33 +578,16 @@ def position_monitor(known_positions: dict, sma_cache: dict) -> None:
     # --- P0-2: detect closes via REALIZED MT5 deal history, not floating P&L ---
     closed_tickets = [t for t in known_positions if t not in current_tickets]
     if closed_tickets:
-        since = datetime.datetime.utcnow() - datetime.timedelta(hours=6)
-        now = datetime.datetime.utcnow()
-        deals = mt5.history_deals_get(since, now)
-        if deals is None:
-            log.error(
-                "position_monitor: history_deals_get() returned None while reconciling closed "
-                "tickets. Cannot confirm realized P&L this pass -- will retry next cycle."
-            )
-        else:
-            deals_by_position = {}
-            for d in deals:
-                if d.magic != MAGIC_NUMBER or d.entry not in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY):
+        for ticket in closed_tickets:
+                # Query MT5 by position id, not a short arbitrary time window:
+                # this includes entry commissions, partial closes, swaps and fees.
+                realized = risk.realized_pnl_for_position(ticket, MAGIC_NUMBER)
+                if realized is None:
+                    log.warning(f"Ticket #{ticket} has no complete MT5 deal history yet; will retry.")
                     continue
-                deals_by_position.setdefault(d.position_id, []).append(d)
-
-            for ticket in closed_tickets:
-                closing_deals = deals_by_position.get(ticket)
-                if not closing_deals:
-                    log.warning(
-                        f"Ticket #{ticket} disappeared from open positions but no closing deal "
-                        f"found yet in history. Will retry reconciliation next pass."
-                    )
-                    continue
-                realized = sum(d.profit + d.commission + d.swap for d in closing_deals)
                 risk.record_trade_closed(realized)
                 log.info(f"Ticket #{ticket} closed. Realized P&L: {realized:.2f}. Recorded as "
-                         f"{'WIN' if realized > 0 else 'LOSS'}.")
+                         f"{'WIN' if realized > 0 else 'LOSS' if realized < 0 else 'BREAKEVEN'}.")
                 del known_positions[ticket]
 
 
@@ -584,7 +599,7 @@ def main() -> None:
     acquire_single_instance_lock()
 
     log.info("=" * 60)
-    log.info("NIGHTSHADE SEED ENGINE v1 — STARTING")
+    log.info("NIGHTSHADE SEED ENGINE v6 — STARTING")
     log.info("=" * 60)
 
     if not startup_mt5():
@@ -592,7 +607,9 @@ def main() -> None:
 
     try:
         # P0-14: MT5 history is authoritative; reconcile cached JSON on startup.
-        risk.reconcile_state_from_history(MAGIC_NUMBER)
+        if risk.reconcile_state_from_history(MAGIC_NUMBER) is None:
+            log.critical("Cannot reconcile MT5 state at startup; refusing to trade with uncertain limits.")
+            raise SystemExit(1)
 
         known_positions: dict = {}
         sma_cache: dict = {}

@@ -1,7 +1,12 @@
 """
-Nightshade Seed Engine - statistics.py  v4
+Nightshade Seed Engine - statistics.py  v5
 Standalone market snapshot. NOT imported by main.py.
-Shows current indicator state, signal status, and streak for all four pairs.
+
+Changes vs v4 (per GitHub issue from tech review):
+  P0-3  Standard deviation now uses population stdev (ddof=0), matching
+        the spec (and now consistent with pull_mt5.py and main.py).
+  P0-4  Daily state display shows last_evaluated info and a note that
+        daily_state.json is a cache reconciled from MT5 history at startup.
 
 Usage:
     python statistics.py
@@ -13,11 +18,12 @@ import numpy as np
 import json
 import os
 import datetime
+import risk
 
 SYMBOLS            = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
 TIMEFRAME          = mt5.TIMEFRAME_M15
 FETCH_COUNT        = 120
-STATE_FILE         = "daily_state.json"
+STATE_FILE         = risk.STATE_FILE
 
 BB_PERIOD          = 20
 BB_STD_MULT        = 2.5
@@ -37,12 +43,15 @@ if not mt5.initialize():
     quit()
 
 account = mt5.account_info()
+if account is None:
+    print("MT5 account_info() failed; no diagnostic values can be trusted.")
+    mt5.shutdown()
+    raise SystemExit(1)
 
 print("=" * 65)
-print("NIGHTSHADE v4 — LAYER 2 STRATEGY SNAPSHOT")
+print("NIGHTSHADE v5 — LAYER 2 STRATEGY SNAPSHOT")
 print(f"Time (UTC): {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"Account:    {account.login} | "
-      f"Equity: {account.equity:.2f} {account.currency}")
+print(f"Account:    {account.login} | Equity: {account.equity:.2f} {account.currency}")
 print("=" * 65)
 
 # ---------------------------------------------------------------------------
@@ -53,12 +62,16 @@ if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
-        today  = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        if state.get("date") != datetime.datetime.utcnow().strftime("%Y-%m-%d"):
+            print("\nDAILY STATUS  |  State file is stale; run main.py reconciliation before relying on it.")
+            state = None
+        if state is None:
+            raise ValueError("stale daily state")
         streak = state.get("consecutive_losses", 0)
         trades = state.get("trades_today", 0)
         cb     = state.get("circuit_breaker_active", False)
         last   = state.get("last_trade_result", "none yet")
-        bar    = "█" * streak + "░" * (CONSECUTIVE_LIMIT - streak)
+        bar    = "█" * streak + "░" * max(0, CONSECUTIVE_LIMIT - streak)
 
         print(f"\nDAILY STATUS  |  "
               f"Trades: {trades}/{MAX_DAILY_TRADES}  |  "
@@ -67,6 +80,7 @@ if os.path.exists(STATE_FILE):
               f"CB: {'ACTIVE' if cb else 'OFF'}")
         if cb:
             print("  *** CIRCUIT BREAKER ACTIVE — bot will not trade today ***")
+        print("  (daily_state.json is a cache; main.py reconciles from MT5 history at startup)")
     except Exception:
         print("\nDAILY STATUS  |  State file unreadable.")
 else:
@@ -88,43 +102,25 @@ for sym_name in SYMBOLS:
     if rates is None or len(rates) == 0:
         print(f"\n{sym_name}: Cannot fetch candle data.")
         continue
+    if len(rates) < FETCH_COUNT:
+        print(f"\n{sym_name}: WARNING — only {len(rates)}/{FETCH_COUNT} candles returned.")
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
 
-    # --- Indicators ---
-    df["sma"]          = df["close"].rolling(BB_PERIOD).mean()
-    df["std"]          = df["close"].rolling(BB_PERIOD).std()
+    # --- Indicators (shared live implementation) ---
+    df = risk.compute_indicators(df, BB_PERIOD, ATR_PERIOD, ATR_BASELINE, BB_STD_MULT, ATR_REGIME_MULT)
     df["upper_band"]   = df["sma"] + df["std"] * BB_STD_MULT
     df["lower_band"]   = df["sma"] - df["std"] * BB_STD_MULT
-    df["z_score"]      = (df["close"] - df["sma"]) / df["std"]
-
-    hl                 = df["high"] - df["low"]
-    hc                 = (df["high"] - df["close"].shift()).abs()
-    lc                 = (df["low"]  - df["close"].shift()).abs()
-    df["tr"]           = np.maximum(hl, np.maximum(hc, lc))
-    df["atr"]          = df["tr"].rolling(ATR_PERIOD).mean()
-    df["atr_baseline"] = df["atr"].rolling(ATR_BASELINE).mean()
-
-    # ATR regime filter — PRESERVED
-    df["regime_ok"] = df["atr"] < (df["atr_baseline"] * ATR_REGIME_MULT)
-
-    # Signals — only when regime_ok AND Z-score crosses ±BB_STD_MULT
-    df["signal"] = 0
-    df.loc[df["regime_ok"] & (df["z_score"] < -BB_STD_MULT), "signal"] =  1
-    df.loc[df["regime_ok"] & (df["z_score"] >  BB_STD_MULT), "signal"] = -1
 
     c       = df.iloc[-2]   # last COMPLETED candle
     digits  = sym.digits
     sig_str = "BUY" if c["signal"] == 1 else ("SELL" if c["signal"] == -1 else "HOLD")
 
-    # NaN guard
-    has_nan = any(pd.isna(c[col]) for col in
-                  ["sma", "std", "z_score", "atr", "atr_baseline"])
+    has_nan = any(pd.isna(c[col]) for col in ["sma", "std", "z_score", "atr", "atr_baseline"])
 
     atr_ratio = (c["atr"] / c["atr_baseline"]
-                 if not pd.isna(c["atr"]) and not pd.isna(c["atr_baseline"])
-                    and c["atr_baseline"] > 0
+                 if not pd.isna(c["atr"]) and not pd.isna(c["atr_baseline"]) and c["atr_baseline"] > 0
                  else 0.0)
 
     print(f"{'─' * 65}")
@@ -154,31 +150,26 @@ for sym_name in SYMBOLS:
     sl_pips  = sl_dist / (sym.point * 10) if sl_dist > 0 else 0
     pip_size = sym.point * 10
     pip_val  = (sym.trade_tick_value * (pip_size / sym.trade_tick_size)
-                if sym.trade_tick_size > 0 else 10.0)
+                if sym.trade_tick_size > 0 else 0.0)
     raw_lot  = risk_amt / (sl_pips * pip_val) if sl_pips > 0 and pip_val > 0 else 0
     step     = sym.volume_step
-    lot      = round(max(sym.volume_min, min(sym.volume_max,
-               (raw_lot // step) * step)), 2) if raw_lot > 0 else 0
+    lot      = round((raw_lot // step) * step, 2) if raw_lot > 0 else 0
+    lot_note = ""
+    if 0 < lot < sym.volume_min:
+        lot_note = f"  (below broker min {sym.volume_min} — would be REJECTED, not bumped up)"
+        lot = 0
 
-    print(
-        f"\n  Position sizing ({RISK_PCT}% risk) | "
-        f"Risk: {risk_amt:.2f} | SL: {sl_pips:.1f} pips | Lot: {lot}"
-    )
+    print(f"\n  Position sizing ({RISK_PCT}% risk) | Risk: {risk_amt:.2f} | SL: {sl_pips:.1f} pips | Lot: {lot}{lot_note}")
 
     # --- Recent signal history ---
     recent = df.iloc[-12:-2]
-    fired  = recent[recent["signal"] != 0][["time", "close", "z_score",
-                                             "regime_ok", "signal"]]
+    fired  = recent[recent["signal"] != 0][["time", "close", "z_score", "regime_ok", "signal"]]
     if not fired.empty:
         print(f"\n  Recent signals (last 10 candles):")
         for _, row in fired.iterrows():
             s = "BUY" if row["signal"] == 1 else "SELL"
             blocked = "" if row["regime_ok"] else " [BLOCKED by regime]"
-            print(
-                f"    {row['time']} | {s} | "
-                f"Close: {row['close']:.{digits}f} | "
-                f"Z: {row['z_score']:.2f}{blocked}"
-            )
+            print(f"    {row['time']} | {s} | Close: {row['close']:.{digits}f} | Z: {row['z_score']:.2f}{blocked}")
     else:
         print(f"\n  No signals in the last 10 completed candles.")
 

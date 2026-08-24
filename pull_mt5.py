@@ -1,7 +1,13 @@
 """
-Nightshade Seed Engine - pull_mt5.py  v4
+Nightshade Seed Engine - pull_mt5.py  v5
 Standalone diagnostic. Run before every session.
-Now shows consecutive loss streak and circuit breaker status.
+
+Changes vs v4 (per GitHub issue from tech review):
+  P0-3  Standard deviation now uses population stdev (ddof=0) to match
+        the spec, not pandas' default sample stdev (ddof=1).
+  P0-4  Diagnostics now show margin / margin_free and the full current
+        state schema (including last_evaluated candle count and
+        circuit-breaker note), matching risk.py v5's daily_state.json.
 
 Usage:
     python pull_mt5.py
@@ -13,11 +19,12 @@ import numpy as np
 import json
 import os
 import datetime
+import risk
 
 SYMBOLS      = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
 TIMEFRAME    = mt5.TIMEFRAME_M15
 FETCH_COUNT  = 120
-STATE_FILE   = "daily_state.json"
+STATE_FILE   = risk.STATE_FILE
 MAGIC_NUMBER = 20260818
 
 BB_PERIOD          = 20
@@ -74,17 +81,21 @@ if not terminal.trade_allowed:
 # ---------------------------------------------------------------------------
 
 sep("2. ACCOUNT DETAILS")
-print(f"  Login:     {account.login}")
-print(f"  Broker:    {account.company}")
-print(f"  Server:    {account.server}")
-print(f"  Currency:  {account.currency}")
-print(f"  Balance:   {account.balance:.2f} {account.currency}")
-print(f"  Equity:    {account.equity:.2f} {account.currency}")
-print(f"  Leverage:  1:{account.leverage}")
+print(f"  Login:        {account.login}")
+print(f"  Broker:       {account.company}")
+print(f"  Server:       {account.server}")
+print(f"  Currency:     {account.currency}")
+print(f"  Balance:      {account.balance:.2f} {account.currency}")
+print(f"  Equity:       {account.equity:.2f} {account.currency}")
+print(f"  Margin used:  {account.margin:.2f} {account.currency}")
+print(f"  Margin free:  {account.margin_free:.2f} {account.currency}")
+if account.margin > 0:
+    print(f"  Margin level: {account.margin_level:.1f}%")
+print(f"  Leverage:     1:{account.leverage}")
 mode = "DEMO" if account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else "LIVE"
-print(f"  Mode:      {mode}")
+print(f"  Mode:         {mode}")
 if mode == "LIVE":
-    print("  WARNING: LIVE account. Always test on DEMO first.")
+    print("  WARNING: LIVE account. Do not run until all P0 issues are fixed and tested on demo.")
 
 # ---------------------------------------------------------------------------
 # 3. Symbol Check
@@ -107,11 +118,15 @@ for sym_name in SYMBOLS:
     spread_pip = ((tick.ask - tick.bid) / (sym.point * 10)) if tick else 0.0
     status     = "PASS" if tick else "WARN"
 
+    if tick is None:
+        print(f"  WARN: {sym_name} | no current tick; cannot report executable spread.")
+        continue
     print(
         f"  {status}: {sym_name} | "
         f"Bid: {tick.bid:.{sym.digits}f} | Ask: {tick.ask:.{sym.digits}f} | "
         f"Spread: {spread_pip:.1f} pips | "
-        f"Pip val: {pip_value:.4f} {account.currency}/lot"
+        f"Pip val: {pip_value:.4f} {account.currency}/lot | "
+        f"Min lot: {sym.volume_min}"
     )
     if spread_pip > 5.0:
         print(f"         WARNING: Wide spread ({spread_pip:.1f} pips). Avoid trading.")
@@ -128,41 +143,26 @@ for sym_name in SYMBOLS:
     if rates is None or len(rates) == 0 or sym is None:
         print(f"  FAIL: {sym_name} — cannot fetch candles.")
         continue
+    if len(rates) < FETCH_COUNT:
+        print(f"  WARN: {sym_name} — only {len(rates)}/{FETCH_COUNT} candles returned.")
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
 
-    df["sma"]          = df["close"].rolling(BB_PERIOD).mean()
-    df["std"]          = df["close"].rolling(BB_PERIOD).std()
-    df["z_score"]      = (df["close"] - df["sma"]) / df["std"]
-    hl                 = df["high"] - df["low"]
-    hc                 = (df["high"] - df["close"].shift()).abs()
-    lc                 = (df["low"]  - df["close"].shift()).abs()
-    df["tr"]           = np.maximum(hl, np.maximum(hc, lc))
-    df["atr"]          = df["tr"].rolling(ATR_PERIOD).mean()
-    df["atr_baseline"] = df["atr"].rolling(ATR_BASELINE).mean()
-    df["regime_ok"]    = df["atr"] < (df["atr_baseline"] * ATR_REGIME_MULT)
-    df["signal"]       = 0
-    df.loc[df["regime_ok"] & (df["z_score"] < -BB_STD_MULT), "signal"] =  1
-    df.loc[df["regime_ok"] & (df["z_score"] >  BB_STD_MULT), "signal"] = -1
+    df = risk.compute_indicators(df, BB_PERIOD, ATR_PERIOD, ATR_BASELINE, BB_STD_MULT, ATR_REGIME_MULT)
 
     c       = df.iloc[-2]
     sig_str = "BUY" if c["signal"] == 1 else ("SELL" if c["signal"] == -1 else "HOLD")
 
-    nan_cols = [col for col in ["sma", "atr", "atr_baseline", "z_score"]
-                if pd.isna(c[col])]
+    nan_cols = [col for col in ["sma", "atr", "atr_baseline", "z_score"] if pd.isna(c[col])]
     nan_note = f" | NaN in {nan_cols}!" if nan_cols else ""
 
     print(
         f"  {sym_name} | {c['time']} | "
-        f"Close: {c['close']:.{sym.digits}f} | "
-        f"Z: {c['z_score']:.2f} | "
-        f"ATR: {c['atr']:.5f} | "
-        f"Regime: {c['regime_ok']} | "
-        f"Signal: {sig_str}{nan_note}"
+        f"Close: {c['close']:.{sym.digits}f} | Z: {c['z_score']:.2f} | "
+        f"ATR: {c['atr']:.5f} | Regime: {c['regime_ok']} | Signal: {sig_str}{nan_note}"
     )
 
-    # Position sizing simulation
     equity    = account.equity
     risk_amt  = equity * (RISK_PCT / 100.0)
     atr_val   = float(c["atr"]) if not pd.isna(c["atr"]) else 0
@@ -170,16 +170,16 @@ for sym_name in SYMBOLS:
     sl_pips   = sl_dist / (sym.point * 10) if sl_dist > 0 else 0
     pip_size  = sym.point * 10
     pip_val   = (sym.trade_tick_value * (pip_size / sym.trade_tick_size)
-                 if sym.trade_tick_size > 0 else 10.0)
+                 if sym.trade_tick_size > 0 else 0.0)
     raw_lot   = risk_amt / (sl_pips * pip_val) if sl_pips > 0 and pip_val > 0 else 0
     step      = sym.volume_step
-    lot       = round(max(sym.volume_min, min(sym.volume_max,
-                (raw_lot // step) * step)), 2) if raw_lot > 0 else 0
+    lot       = round((raw_lot // step) * step, 2) if raw_lot > 0 else 0
+    lot_note  = ""
+    if 0 < lot < sym.volume_min:
+        lot_note = f" | REJECT (below broker min {sym.volume_min} — would over-risk if bumped up)"
+        lot = 0
 
-    print(
-        f"         Sizing | Risk: {risk_amt:.2f} | "
-        f"SL: {sl_pips:.1f} pips | Lot: {lot}"
-    )
+    print(f"         Sizing | Risk: {risk_amt:.2f} | SL: {sl_pips:.1f} pips | Lot: {lot}{lot_note}")
 
 # ---------------------------------------------------------------------------
 # 5. Daily State — consecutive loss streak
@@ -194,8 +194,7 @@ if os.path.exists(STATE_FILE):
         today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
         stale = state.get("date") != today
 
-        print(f"  Date:               {state.get('date')} "
-              f"{'(STALE — resets on first cycle)' if stale else '(TODAY)'}")
+        print(f"  Date:               {state.get('date')} {'(STALE — resets on first cycle)' if stale else '(TODAY)'}")
         print(f"  Start equity:       {state.get('start_equity')}")
         print(f"  Trades today:       {state.get('trades_today', 0)} / {MAX_DAILY_TRADES}")
 
@@ -203,10 +202,20 @@ if os.path.exists(STATE_FILE):
         last   = state.get("last_trade_result", None)
         cb     = state.get("circuit_breaker_active", False)
 
-        streak_bar = "█" * streak + "░" * (CONSECUTIVE_LIMIT - streak)
+        streak_bar = "█" * streak + "░" * max(0, CONSECUTIVE_LIMIT - streak)
         print(f"  Consecutive losses: {streak} / {CONSECUTIVE_LIMIT}  [{streak_bar}]")
         print(f"  Last trade result:  {last if last else 'None yet today'}")
         print(f"  Circuit breaker:    {'ACTIVE — no trades today' if cb else 'OFF'}")
+
+        last_eval = state.get("last_evaluated", {})
+        if last_eval:
+            print(f"  Last evaluated candles: {last_eval}")
+
+        print(
+            "\n  NOTE: this file is a CACHE. main.py reconciles authoritative state "
+            "from MT5 trade history on every startup — this display may lag until "
+            "the bot next runs."
+        )
 
         if cb:
             print(
@@ -231,10 +240,14 @@ else:
 
 sep("6. OPEN POSITIONS — ALL PAIRS")
 
-all_pos  = mt5.positions_get()
-our_pos  = [p for p in all_pos if p.magic == MAGIC_NUMBER] if all_pos else []
+all_pos = mt5.positions_get()
+if all_pos is None:
+    print("  FAIL: positions_get() returned None — cannot confirm open positions. Treat as unknown, not zero.")
+    our_pos = []
+else:
+    our_pos = [p for p in all_pos if p.magic == MAGIC_NUMBER]
 
-if not our_pos:
+if all_pos is not None and not our_pos:
     print("  No open positions for this bot.")
 else:
     for p in our_pos:
@@ -243,10 +256,8 @@ else:
         digits    = sym.digits if sym else 5
         print(
             f"  {p.symbol} | {direction} {p.volume} lots | "
-            f"Open: {p.price_open:.{digits}f} | "
-            f"SL: {p.sl:.{digits}f} | TP: {p.tp:.{digits}f} | "
-            f"P&L: {p.profit:.2f} {account.currency} | "
-            f"Ticket: #{p.ticket}"
+            f"Open: {p.price_open:.{digits}f} | SL: {p.sl:.{digits}f} | TP: {p.tp:.{digits}f} | "
+            f"P&L: {p.profit:.2f} {account.currency} | Ticket: #{p.ticket}"
         )
 
 # ---------------------------------------------------------------------------
