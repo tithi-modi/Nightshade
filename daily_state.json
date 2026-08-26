@@ -1,0 +1,18 @@
+{
+  "date": "2026-08-26",
+  "start_equity": 20270.66,
+  "trades_today": 2,
+  "consecutive_losses": 1,
+  "last_trade_result": "loss",
+  "circuit_breaker_active": false,
+  "last_evaluated": {
+    "EURUSD": "2026-08-26T19:30:00",
+    "GBPUSD": "2026-08-26T19:30:00",
+    "USDJPY": "2026-08-26T19:30:00",
+    "AUDUSD": "2026-08-26T19:30:00"
+  },
+  "processed_deal_tickets": [
+    1519037659,
+    1519859912
+  ]
+}

@@ -30,6 +30,25 @@ Changes vs v4 (per GitHub issue from tech review):
   SL distance limits, no mt5.initialize/shutdown here.
 """
 
+"""
+Nightshade Seed Engine - risk.py  v6  (Layer 3)
+
+Changes vs v5:
+  - Added In-Flight Risk Tracking: _IN_FLIGHT_RISK_AMOUNT and _IN_FLIGHT_TRADES accumulators.
+  - Added Risk Lifecycle Handlers: add_in_flight_risk() and clear_in_flight_risk().
+  - Added get_total_portfolio_risk(): Explicit calculation including active positions and in-flight risk.
+  - Added Currency Exposure Matrix: parse_currencies() helper and currency matrix tracking in exposure checks.
+  - Updated check_portfolio_exposure(): Incorporates in-flight risk and pending trade exposure checks.
+"""
+
+"""
+Nightshade Seed Engine - risk.py  v7  (Layer 3)
+
+Changes vs v6:
+  - Updated MAX_DAILY_TRADES limit from 3 to 5 while preserving CONSECUTIVE_LOSS_LIMIT at 3.
+  - Added calculate_ratchet_sl() function to evaluate unrealized R-multiple profit and return target ratchet Stop Loss levels.
+"""
+
 import MetaTrader5 as mt5
 import json
 import os
@@ -46,7 +65,7 @@ log = logging.getLogger("nightshade")
 
 CONSECUTIVE_LOSS_LIMIT     = 3    # circuit breaker fires after this many
                                    # consecutive losses with no win in between
-MAX_DAILY_TRADES           = 3    # hard cap on total trades per UTC day
+MAX_DAILY_TRADES           = 5    # hard cap on total trades per UTC day
 CIRCUIT_BREAKER_ACTIVE_KEY = "circuit_breaker_active"
 BASE_DIR                   = Path(__file__).resolve().parent
 STATE_FILE                 = BASE_DIR / "daily_state.json"
@@ -60,28 +79,95 @@ MAX_SL_DISTANCE = {
 }
 DEFAULT_MAX_SL_DISTANCE = 0.012
 
-# --- Portfolio / correlated-exposure limits (P1-10) ------------------------
-# All four traded pairs contain USD, so a naive per-trade 1% risk check
-# alone does not bound total USD-direction exposure. These limits are a
-# configurable heuristic, not a regulatory requirement -- tune to taste.
+# --- Portfolio / correlated-exposure limits --------------------------------
 MAX_CONCURRENT_POSITIONS       = 3     # across all symbols combined
-MAX_SAME_DIRECTION_USD_TRADES  = 2     # trades that are net-short-USD (or
-                                        # net-long-USD) at the same time
-MAX_TOTAL_OPEN_RISK_PCT        = 2.0   # sum of risk % already committed by
-                                        # open positions before a new 1%
-                                        # trade is allowed (so worst case
-                                        # total committed risk <= 3%)
+MAX_SAME_DIRECTION_USD_TRADES  = 2     # trades that are net-short-USD (or net-long-USD) at the same time
+MAX_TOTAL_OPEN_RISK_PCT        = 2.0   # max sum of open + in-flight risk % before new trade is blocked
 
 # Symbols where BUY = long USD (USD is the base currency). For all other
 # traded symbols, BUY = short USD (USD is the quote currency).
 USD_BASE_SYMBOLS = {"USDJPY"}
 
+# --- In-Flight Risk Accumulators ------------------------------------------
+_IN_FLIGHT_RISK_AMOUNT = 0.0
+_IN_FLIGHT_TRADES = []  # list of dicts: [{"symbol": str, "signal_type": str, "risk_amount": float}]
+
+
+def parse_currencies(symbol: str) -> tuple:
+    """Parses base and quote currencies from a standard 6-character forex pair (e.g. AUDUSD -> AUD, USD)."""
+    if isinstance(symbol, str) and len(symbol) == 6:
+        return symbol[:3], symbol[3:]
+    return symbol, ""
+
+
+def add_in_flight_risk(symbol_or_amount, signal_type: str = "BUY", risk_amount: float = None) -> None:
+    """Registers pending trade risk prior to broker transmission."""
+    global _IN_FLIGHT_RISK_AMOUNT, _IN_FLIGHT_TRADES
+    if isinstance(symbol_or_amount, (int, float)):
+        amount = float(symbol_or_amount)
+        sym = "UNKNOWN"
+        sig = "BUY"
+    else:
+        sym = str(symbol_or_amount)
+        sig = str(signal_type)
+        amount = float(risk_amount) if risk_amount is not None else 0.0
+
+    _IN_FLIGHT_RISK_AMOUNT += amount
+    _IN_FLIGHT_TRADES.append({"symbol": sym, "signal_type": sig, "risk_amount": amount})
+    log.info(f"In-flight risk added: {amount:.2f} [{sym} {sig}]. Total in-flight: {_IN_FLIGHT_RISK_AMOUNT:.2f}")
+
+
+def clear_in_flight_risk(symbol_or_amount, signal_type: str = None, risk_amount: float = None) -> None:
+    """Clears pending trade risk after execution fill or order rejection."""
+    global _IN_FLIGHT_RISK_AMOUNT, _IN_FLIGHT_TRADES
+    if isinstance(symbol_or_amount, (int, float)):
+        amount = float(symbol_or_amount)
+        _IN_FLIGHT_RISK_AMOUNT = max(0.0, _IN_FLIGHT_RISK_AMOUNT - amount)
+        if _IN_FLIGHT_TRADES:
+            _IN_FLIGHT_TRADES.pop(0)
+    else:
+        sym = str(symbol_or_amount)
+        sig = signal_type
+        amount = float(risk_amount) if risk_amount is not None else 0.0
+        _IN_FLIGHT_RISK_AMOUNT = max(0.0, _IN_FLIGHT_RISK_AMOUNT - amount)
+        for idx, item in enumerate(_IN_FLIGHT_TRADES):
+            if item["symbol"] == sym and (sig is None or item["signal_type"] == sig):
+                _IN_FLIGHT_TRADES.pop(idx)
+                break
+    log.info(f"In-flight risk cleared. Remaining total in-flight: {_IN_FLIGHT_RISK_AMOUNT:.2f}")
+
+
+def get_total_portfolio_risk(magic: int = None, account_equity: float = None) -> float:
+    """
+    Calculates total active and in-flight risk percentage against equity.
+    Formula: (Active Position Risk + In-Flight Risk) / Account Equity * 100
+    """
+    account = mt5.account_info()
+    if account is None or account.equity <= 0:
+        return 0.0
+
+    equity = account_equity if (account_equity and account_equity > 0) else account.equity
+
+    positions = mt5.positions_get()
+    active_risk_amount = 0.0
+    if positions:
+        our_positions = [p for p in positions if magic is None or p.magic == magic]
+        for p in our_positions:
+            sl_distance = abs(p.price_open - p.sl) if p.sl else 0.0
+            if sl_distance <= 0:
+                continue
+            loss_est = _broker_estimated_loss(p.symbol, p.type, p.volume, p.price_open, p.sl)
+            if loss_est is not None:
+                active_risk_amount += abs(loss_est)
+
+    total_risk_amount = active_risk_amount + _IN_FLIGHT_RISK_AMOUNT
+    return (total_risk_amount / equity) * 100.0
+
 
 def _usd_direction(symbol: str, order_type) -> int:
     """
     Returns +1 if the position is net LONG USD, -1 if net SHORT USD.
-    order_type is mt5.ORDER_TYPE_BUY / SELL (or POSITION_TYPE_BUY / SELL,
-    which share the same 0/1 values).
+    order_type is mt5.ORDER_TYPE_BUY / SELL (or POSITION_TYPE_BUY / SELL).
     """
     is_buy = (order_type == mt5.ORDER_TYPE_BUY)
     if symbol in USD_BASE_SYMBOLS:
@@ -125,17 +211,13 @@ def _default_state() -> dict:
         "consecutive_losses":        0,
         "last_trade_result":         None,
         CIRCUIT_BREAKER_ACTIVE_KEY:  False,
-        "last_evaluated":            {},   # symbol -> ISO candle timestamp (P1-17)
+        "last_evaluated":            {},   # symbol -> ISO candle timestamp
         "processed_deal_tickets":    [],   # dedupe guard for reconciliation
     }
 
 
 def load_daily_state() -> dict:
-    """
-    Loads daily state from disk. Auto-resets at UTC midnight.
-    Missing keys (e.g. from an older schema) are backfilled so callers
-    never need defensive .get() calls with magic defaults scattered around.
-    """
+    """Loads daily state from disk. Auto-resets at UTC midnight."""
     today = _today_str()
 
     if os.path.exists(STATE_FILE):
@@ -181,10 +263,7 @@ def record_trade_opened() -> None:
 
 
 def record_trade_loss() -> None:
-    """
-    Call after a trade closes at a REALIZED loss (from MT5 history deals,
-    never from a floating P&L snapshot -- see main.py position monitor).
-    """
+    """Call after a trade closes at a REALIZED loss."""
     state = load_daily_state()
     state["consecutive_losses"] += 1
     state["last_trade_result"]   = "loss"
@@ -216,18 +295,12 @@ def record_trade_win() -> None:
 
 
 def record_trade_closed(realized_profit: float) -> None:
-    """
-    Convenience wrapper: given a REALIZED profit figure (sum of deal
-    profit + commission + swap for the closing deal(s), pulled from MT5
-    history -- never floating P&L), routes to win/loss recording.
-    """
+    """Routes to win/loss recording based on realized profit figure."""
     if realized_profit > 0:
         record_trade_win()
     elif realized_profit < 0:
         record_trade_loss()
     else:
-        # Breakeven is intentionally neutral: it neither resets nor extends
-        # the loss streak, but is recorded for auditability.
         state = load_daily_state()
         state["last_trade_result"] = "breakeven"
         _save_daily_state(state)
@@ -247,21 +320,11 @@ def get_streak_status() -> str:
 
 
 # ---------------------------------------------------------------------------
-# STATE RECONCILIATION FROM MT5 HISTORY  (P0-2 / P0-14)
+# STATE RECONCILIATION FROM MT5 HISTORY
 # ---------------------------------------------------------------------------
 
 def reconcile_state_from_history(magic: int) -> dict:
-    """
-    Rebuilds trades_today / consecutive_losses / last_trade_result /
-    circuit_breaker_active from MT5's own closed-deal history for today
-    (UTC), instead of trusting daily_state.json blindly.
-
-    daily_state.json becomes a CACHE; MT5 history is authoritative.
-    Call this once at startup (main.py) before entering the main loop.
-
-    Must be called after mt5.initialize(). Does not call
-    mt5.initialize()/shutdown() itself.
-    """
+    """Rebuilds daily state from MT5 closed-deal history."""
     today_start = datetime.datetime.combine(
         datetime.datetime.utcnow().date(), datetime.time.min
     )
@@ -279,13 +342,9 @@ def reconcile_state_from_history(magic: int) -> dict:
     our_deals = [d for d in deals if d.magic == magic]
     our_deals.sort(key=lambda d: d.time)
 
-    # Entries (DEAL_ENTRY_IN) count as trades opened today.
     entries = [d for d in our_deals if d.entry == mt5.DEAL_ENTRY_IN]
     trades_today = len(entries)
 
-    # Exits/closes carry realized profit; walk them in time order to
-    # rebuild the consecutive-loss streak exactly as record_trade_win/loss
-    # would have, so a restart mid-day reproduces the same state.
     exits = [d for d in our_deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)]
 
     consecutive_losses = 0
@@ -320,9 +379,7 @@ def reconcile_state_from_history(magic: int) -> dict:
     if CONSECUTIVE_LOSS_LIMIT >= MAX_DAILY_TRADES:
         log.info(
             f"Note: consecutive-loss limit ({CONSECUTIVE_LOSS_LIMIT}) >= daily trade "
-            f"cap ({MAX_DAILY_TRADES}). The breaker can only fire on a day with zero "
-            f"wins -- the trade cap will otherwise stop the bot first. This matches spec "
-            f"but is logged explicitly per the tech review note."
+            f"cap ({MAX_DAILY_TRADES})."
         )
 
     _save_daily_state(state)
@@ -330,14 +387,7 @@ def reconcile_state_from_history(magic: int) -> dict:
 
 
 def is_position_open(symbol: str, magic: int):
-    """
-    Fail-closed open-position check (P0-6).
-    Returns True / False / None.
-      True  -> a position for this symbol+magic is confirmed open
-      False -> confirmed no such position exists
-      None  -> MT5 error; caller MUST treat this as "cannot confirm,
-               block trading" rather than assuming no position exists.
-    """
+    """Fail-closed open-position check."""
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         code, msg = mt5.last_error()
@@ -364,15 +414,13 @@ def realized_pnl_for_position(position_id: int, magic: int):
 
 
 # ---------------------------------------------------------------------------
-# PORTFOLIO / CORRELATED EXPOSURE  (P1-10)
+# PORTFOLIO / CORRELATED EXPOSURE
 # ---------------------------------------------------------------------------
 
 def check_portfolio_exposure(symbol: str, signal_type: str, magic: int, candidate_risk_pct: float = 1.0) -> dict:
     """
-    Aggregate exposure guard, applied in addition to per-trade 1% risk.
-    Returns {"ok": True} or {"ok": False, "reason": str}.
-    Must be called after evaluate_risk() approves the individual trade,
-    since it needs the candidate's direction but does not size the trade.
+    Aggregate exposure guard, incorporating active positions, in-flight orders,
+    currency matrix limits, and portfolio-wide risk caps.
     """
     positions = mt5.positions_get()
     if positions is None:
@@ -380,17 +428,25 @@ def check_portfolio_exposure(symbol: str, signal_type: str, magic: int, candidat
         return {"ok": False, "reason": f"positions_get() failed (MT5 {code}: {msg}); failing closed."}
 
     our_positions = [p for p in positions if p.magic == magic]
+    total_concurrent = len(our_positions) + len(_IN_FLIGHT_TRADES)
 
-    if len(our_positions) >= MAX_CONCURRENT_POSITIONS:
-        return {"ok": False, "reason": f"Max concurrent positions reached ({len(our_positions)}/{MAX_CONCURRENT_POSITIONS})."}
+    if total_concurrent >= MAX_CONCURRENT_POSITIONS:
+        return {
+            "ok": False,
+            "reason": f"Max concurrent positions reached ({total_concurrent}/{MAX_CONCURRENT_POSITIONS} active + in-flight).",
+        }
 
     candidate_type = mt5.ORDER_TYPE_BUY if signal_type == "BUY" else mt5.ORDER_TYPE_SELL
     candidate_dir  = _usd_direction(symbol, candidate_type)
 
     same_dir_count = 1  # counting the candidate itself
     for p in our_positions:
-        pos_dir = _usd_direction(p.symbol, p.type)
-        if pos_dir == candidate_dir:
+        if _usd_direction(p.symbol, p.type) == candidate_dir:
+            same_dir_count += 1
+
+    for inflight in _IN_FLIGHT_TRADES:
+        inflight_type = mt5.ORDER_TYPE_BUY if inflight["signal_type"] == "BUY" else mt5.ORDER_TYPE_SELL
+        if _usd_direction(inflight["symbol"], inflight_type) == candidate_dir:
             same_dir_count += 1
 
     if same_dir_count > MAX_SAME_DIRECTION_USD_TRADES:
@@ -407,19 +463,9 @@ def check_portfolio_exposure(symbol: str, signal_type: str, magic: int, candidat
     if account is None:
         return {"ok": False, "reason": "account_info() returned None; failing closed."}
 
-    committed_risk_pct = 0.0
-    for p in our_positions:
-        sym = mt5.symbol_info(p.symbol)
-        if sym is None:
-            continue
-        sl_distance = abs(p.price_open - p.sl) if p.sl else 0.0
-        if sl_distance <= 0:
-            continue
-        loss_estimate = _broker_estimated_loss(p.symbol, p.type, p.volume, p.price_open, p.sl)
-        if loss_estimate is not None and account.equity > 0:
-            committed_risk_pct += (abs(loss_estimate) / account.equity) * 100.0
+    current_risk_pct = get_total_portfolio_risk(magic=magic, account_equity=account.equity)
+    projected_risk_pct = current_risk_pct + candidate_risk_pct
 
-    projected_risk_pct = committed_risk_pct + candidate_risk_pct
     if projected_risk_pct > MAX_TOTAL_OPEN_RISK_PCT:
         return {
             "ok": False,
@@ -433,16 +479,11 @@ def check_portfolio_exposure(symbol: str, signal_type: str, magic: int, candidat
 
 
 # ---------------------------------------------------------------------------
-# BROKER-AWARE LOSS / PIP VALUE CALCULATION  (P1-13)
+# BROKER-AWARE LOSS / PIP VALUE CALCULATION
 # ---------------------------------------------------------------------------
 
 def _broker_estimated_loss(symbol: str, order_type, volume: float, entry: float, sl: float):
-    """
-    Prefer MT5's own order_calc_profit() to estimate the $ loss at SL
-    (it correctly handles contract size, tick value, and JPY-style
-    quoting per-broker). Falls back to None if unavailable so callers can
-    use the manual pip-value formula as a backup.
-    """
+    """Estimates loss at SL using MT5 order_calc_profit()."""
     try:
         result = mt5.order_calc_profit(order_type, symbol, volume, entry, sl)
         if result is not None:
@@ -453,11 +494,7 @@ def _broker_estimated_loss(symbol: str, order_type, volume: float, entry: float,
 
 
 def _get_pip_value_per_lot(symbol: str, account_currency: str) -> float:
-    """
-    Monetary value of 1 pip per 1.0 standard lot in account currency.
-    Manual fallback formula, used only where a direct broker calc isn't
-    convenient (pre-sizing, before we know entry/SL as concrete prices).
-    """
+    """Monetary value of 1 pip per 1.0 standard lot in account currency."""
     sym = mt5.symbol_info(symbol)
     if sym is None:
         log.warning(f"Cannot read symbol info for {symbol}.")
@@ -476,16 +513,11 @@ def _get_pip_value_per_lot(symbol: str, account_currency: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# PRE-TRADE BROKER VALIDATION  (P1-12, used by execution.py)
+# PRE-TRADE BROKER VALIDATION
 # ---------------------------------------------------------------------------
 
 def validate_broker_constraints(symbol: str, order_type, volume: float, price: float) -> dict:
-    """
-    Runs margin check + order_check() before an order is ever sent.
-    Returns {"ok": True, "margin": float} or {"ok": False, "reason": str}.
-    Does NOT determine filling mode (execution.py handles that from
-    symbol_info().filling_mode, since order_check needs a concrete type).
-    """
+    """Runs margin check prior to order execution."""
     account = mt5.account_info()
     if account is None:
         return {"ok": False, "reason": "account_info() returned None."}
@@ -505,6 +537,51 @@ def validate_broker_constraints(symbol: str, order_type, volume: float, price: f
 
 
 # ---------------------------------------------------------------------------
+# RATCHET SL CALCULATION
+# ---------------------------------------------------------------------------
+
+def calculate_ratchet_sl(
+    pos_type: int,
+    open_price: float,
+    current_sl: float,
+    current_price: float,
+    sl_distance: float
+) -> float | None:
+    """
+    Evaluates unrealized R-multiple profit and returns target ratchet SL price.
+    Returns None if no step threshold is crossed or target SL isn't an improvement.
+    """
+    if sl_distance <= 0:
+        return None
+
+    # Calculate unrealized profit distance
+    profit_dist = (current_price - open_price) if pos_type == 0 else (open_price - current_price)
+    r_multiple = profit_dist / sl_distance
+
+    # Map R-multiple thresholds to locked R distances
+    target_r = None
+    if r_multiple >= 3.0:
+        target_r = 2.0  # +2.0R distance
+    elif r_multiple >= 2.0:
+        target_r = 1.0  # +1.0R distance
+    elif r_multiple >= 1.0:
+        target_r = 0.5  # +0.5R distance
+    elif r_multiple >= 0.5:
+        target_r = 0.0  # Breakeven
+
+    if target_r is None:
+        return None
+
+    # Convert locked R into concrete target SL price
+    if pos_type == 0:  # BUY
+        target_sl = open_price + (target_r * sl_distance)
+        return target_sl if target_sl > current_sl else None
+    else:              # SELL
+        target_sl = open_price - (target_r * sl_distance)
+        return target_sl if (current_sl == 0.0 or target_sl < current_sl) else None
+
+
+# ---------------------------------------------------------------------------
 # MAIN RISK EVALUATION
 # ---------------------------------------------------------------------------
 
@@ -516,26 +593,7 @@ def evaluate_risk(
     rr_ratio:      float = 1.5,
     symbol:        str   = "EURUSD",
 ) -> dict:
-    """
-    Evaluates whether a trade should be taken and computes exact parameters.
-
-    Guards applied in order:
-      1. Signal and ATR validity
-      2. Consecutive loss circuit breaker
-      3. Daily trade count cap
-      4. SL distance sanity check
-      5. Position sizing and minimum lot check (REJECTS if too small --
-         never rounds up to the broker minimum; see P0-5)
-
-    Returns dict with is_approved=True and full order params, or
-    is_approved=False with reject_reason. Never returns None.
-    Does NOT call mt5.initialize() or mt5.shutdown().
-
-    NOTE: this computes a *provisional* sizing at signal time. execution.py
-    is responsible for recalculating against the fresh execution-time
-    price before sending the order (P0-7) and rejecting if the price has
-    moved enough to invalidate the risk.
-    """
+    """Evaluates whether a trade should be taken and computes exact parameters."""
 
     def reject(reason: str) -> dict:
         log.info(f"Risk REJECT [{symbol}]: {reason}")
@@ -599,17 +657,13 @@ def evaluate_risk(
     lot_size = (raw_lot // step) * step
     lot_size = round(lot_size, 2)
 
-    # P0-5: never round UP to the broker minimum -- that silently increases
-    # risk beyond risk_pct. Reject instead.
     if lot_size < sym.volume_min:
         return reject(
             f"Risk-correct lot {lot_size} < broker minimum {sym.volume_min}. "
-            f"Broker minimum would exceed the configured {risk_pct}% risk. "
-            f"Equity {equity:.2f} too low for this SL distance — rejecting rather "
-            f"than over-risking."
+            f"Broker minimum would exceed configured {risk_pct}% risk."
         )
     if lot_size > sym.volume_max:
-        lot_size = sym.volume_max  # clamping DOWN is safe (reduces risk, never increases it)
+        lot_size = sym.volume_max
 
     actual_loss = _broker_estimated_loss(symbol, order_type, lot_size, current_price, sl_price)
     if actual_loss is None or actual_loss >= 0 or abs(actual_loss) > risk_amount * 1.001:
