@@ -49,12 +49,23 @@ Changes vs v6:
   - Added calculate_ratchet_sl() function to evaluate unrealized R-multiple profit and return target ratchet Stop Loss levels.
 """
 
+"""
+Nightshade Seed Engine - risk.py  v8  (Layer 3)
+
+Changes vs v7:
+  - Added Peak Giveback & Circuit Breaker constants (GIVEBACK_ACTIVATION_EUR, GIVEBACK_TIERS, HARD_GIVEBACK_CAP_PCT, DECLINE_NOISE_TOLERANCE).
+  - Added Time-Decay TP schedule constants (TIME_DECAY_TP_R).
+  - Added calculate_time_decay_tp() for time-decay profit target recalculations.
+  - Added evaluate_hard_giveback_cap(), evaluate_giveback_exit(), and evaluate_decline_to_zero() pure exit evaluation functions.
+"""
+
 import MetaTrader5 as mt5
 import json
 import os
 import tempfile
 import datetime
 import logging
+import math
 from pathlib import Path
 
 log = logging.getLogger("nightshade")
@@ -69,6 +80,24 @@ MAX_DAILY_TRADES           = 5    # hard cap on total trades per UTC day
 CIRCUIT_BREAKER_ACTIVE_KEY = "circuit_breaker_active"
 BASE_DIR                   = Path(__file__).resolve().parent
 STATE_FILE                 = BASE_DIR / "daily_state.json"
+
+# --- Peak Giveback & Circuit Breaker Constants ---
+GIVEBACK_ACTIVATION_EUR = 50.0
+GIVEBACK_TIERS = [
+    (100.0, 0.40),         # Peak €50 - €100  -> allow 40% give-back
+    (200.0, 0.25),         # Peak €100 - €200 -> allow 25% give-back
+    (float("inf"), 0.10),  # Peak > €200      -> allow 10% give-back
+]
+HARD_GIVEBACK_CAP_PCT = 0.50  # Hard circuit breaker: trigger if PnL retraces >= 50% AND < €0
+DECLINE_NOISE_TOLERANCE = 0.05 # €0.05 noise tolerance for trend detection
+
+# --- Time-Decay TP Schedules ---
+TIME_DECAY_TP_R = [
+    (15 * 60, 1.5),        # 0–15 min: 1.5R target
+    (30 * 60, 1.0),        # 15–30 min: 1.0R target
+    (45 * 60, 0.5),        # 30–45 min: 0.5R target
+    (float("inf"), 0.05),  # 45+ min: 0.05R (breakeven + fee cover)
+]
 
 # Maximum SL distance in price terms per symbol.
 MAX_SL_DISTANCE = {
@@ -537,7 +566,7 @@ def validate_broker_constraints(symbol: str, order_type, volume: float, price: f
 
 
 # ---------------------------------------------------------------------------
-# RATCHET SL CALCULATION
+# RATCHET SL CALCULATION & EXIT RULES
 # ---------------------------------------------------------------------------
 
 def calculate_ratchet_sl(
@@ -579,6 +608,74 @@ def calculate_ratchet_sl(
     else:              # SELL
         target_sl = open_price - (target_r * sl_distance)
         return target_sl if (current_sl == 0.0 or target_sl < current_sl) else None
+
+
+def calculate_time_decay_tp(open_price: float, pos_type: int, sl_distance: float, 
+                            elapsed_seconds: float, digits: int) -> float:
+    """Calculates updated TP price based on elapsed trade duration."""
+    target_r = 0.05
+    for max_elapsed, r_val in TIME_DECAY_TP_R:
+        if elapsed_seconds <= max_elapsed:
+            target_r = r_val
+            break
+
+    # MT5 Buy = 0, Sell = 1
+    if pos_type == 0:
+        raw_tp = open_price + (target_r * sl_distance)
+    else:
+        raw_tp = open_price - (target_r * sl_distance)
+
+    return round(raw_tp, digits)
+
+
+def evaluate_hard_giveback_cap(peak_pnl: float, current_pnl: float) -> dict:
+    """Circuit Breaker: Forces exit if trade loses >= 50% of peak AND drops into negative territory."""
+    if peak_pnl >= GIVEBACK_ACTIVATION_EUR and current_pnl < 0:
+        retrace_pct = (peak_pnl - current_pnl) / peak_pnl
+        if retrace_pct >= HARD_GIVEBACK_CAP_PCT:
+            return {
+                "exit": True, 
+                "reason": f"HARD CAP: Retraced {retrace_pct * 100:.1f}% off peak €{peak_pnl:.2f} (Current: €{current_pnl:.2f})"
+            }
+    return {"exit": False}
+
+
+def evaluate_giveback_exit(peak_pnl: float, current_pnl: float) -> dict:
+    """Tiered high-water mark lock with non-negative (€0.00) floor guard."""
+    if peak_pnl < GIVEBACK_ACTIVATION_EUR:
+        return {"exit": False}
+
+    allowed_pct = 0.40
+    for ceiling, pct in GIVEBACK_TIERS:
+        if peak_pnl <= ceiling:
+            allowed_pct = pct
+            break
+
+    target_exit_pnl = max(0.0, peak_pnl * (1.0 - allowed_pct))
+    
+    if current_pnl <= target_exit_pnl:
+        return {
+            "exit": True,
+            "reason": f"Tiered Exit: Target €{target_exit_pnl:.2f} hit off peak €{peak_pnl:.2f} ({allowed_pct * 100:.0f}% allowed give-back)"
+        }
+    return {"exit": False}
+
+
+def evaluate_decline_to_zero(pnl_history: list) -> dict:
+    """Triggers exit if PnL shows a stable downward trend and crosses into <= €0."""
+    if len(pnl_history) < 4:
+        return {"exit": False}
+
+    recent = [p[1] for p in pnl_history[-4:]]
+    is_declining = all(
+        recent[i + 1] <= (recent[i] + DECLINE_NOISE_TOLERANCE)
+        for i in range(len(recent) - 1)
+    )
+    crossed_zero = recent[-2] > 0 and recent[-1] <= 0
+
+    if is_declining and crossed_zero:
+        return {"exit": True, "reason": "30s Trend Decay: Steady decline crossed zero threshold."}
+    return {"exit": False}
 
 
 # ---------------------------------------------------------------------------

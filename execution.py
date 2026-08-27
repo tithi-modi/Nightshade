@@ -39,11 +39,22 @@ Changes vs v6:
   - Added process_active_position_ratchets() as a self-contained orchestrator for main.py tick loop.
 """
 
+"""
+Nightshade Seed Engine - execution.py  v8  (Layer 4)
+
+Changes vs v7:
+  - Added _POSITION_MONITOR_STATE tracking and helper functions (_get_or_init_monitor_state, _cleanup_monitor_state).
+  - Added _close_position_market() for sending market order exit requests to MT5.
+  - Added process_advanced_position_management() orchestrator for handling dynamic giveback exits,
+    30s trend decline checks, hard cap circuit breakers, and server-side time-decay TP updates.
+"""
+
 import MetaTrader5 as mt5
 import time
 import logging
 import threading
 
+import risk
 from risk import (
     record_trade_opened,
     evaluate_risk,
@@ -82,6 +93,7 @@ SYMBOL_FILLING_FOK = 1
 SYMBOL_FILLING_IOC = 2
 
 _EXECUTION_LOCK = threading.Lock()
+_POSITION_MONITOR_STATE = {}
 
 
 def sync_positions(symbol: str = None) -> None:
@@ -394,7 +406,7 @@ def _execute_order_locked(
 
 
 # ---------------------------------------------------------------------------
-# POSITION MODIFICATION & RATCHET ORCHESTRATION
+# POSITION MODIFICATION & ADVANCED POSITION MANAGEMENT
 # ---------------------------------------------------------------------------
 
 def modify_position_sl(ticket: int, symbol: str, new_sl: float, tp: float = 0.0) -> bool:
@@ -460,3 +472,120 @@ def process_active_position_ratchets(trade_sl_distances: dict) -> None:
 
         if target_sl:
             modify_position_sl(pos.ticket, pos.symbol, target_sl, pos.tp)
+
+
+def _get_or_init_monitor_state(ticket: int) -> dict:
+    """Fetch or initialize active trade state tracker."""
+    if ticket not in _POSITION_MONITOR_STATE:
+        _POSITION_MONITOR_STATE[ticket] = {
+            "peak_pnl": 0.0,
+            "pnl_history": []  # Stores (timestamp, net_pnl) tuples
+        }
+    return _POSITION_MONITOR_STATE[ticket]
+
+
+def _cleanup_monitor_state(active_tickets: set) -> None:
+    """Prunes closed trades from memory."""
+    for ticket in list(_POSITION_MONITOR_STATE.keys()):
+        if ticket not in active_tickets:
+            _POSITION_MONITOR_STATE.pop(ticket, None)
+
+
+def _close_position_market(pos, reason: str, log: logging.Logger) -> bool:
+    """Executes market order to close an open position by ticket."""
+    tick = mt5.symbol_info_tick(pos.symbol)
+    if not tick:
+        return False
+
+    price = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
+    order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "position": pos.ticket,
+        "symbol": pos.symbol,
+        "volume": pos.volume,
+        "type": order_type,
+        "price": price,
+        "deviation": 10,
+        "magic": pos.magic,
+        "comment": f"Close: {reason[:20]}",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        log.info(f"[{pos.symbol}] Closed ticket #{pos.ticket}. Reason: {reason}")
+        return True
+    
+    log.error(f"[{pos.symbol}] Failed to close ticket #{pos.ticket}. Result: {result.comment if result else 'None'}")
+    return False
+
+
+def process_advanced_position_management(trade_sl_distances: dict, log: logging.Logger = None) -> None:
+    """Orchestrator called on every 30-second polling cycle."""
+    if log is None:
+        log = logging.getLogger("nightshade")
+
+    positions = mt5.positions_get()
+    if not positions:
+        _cleanup_monitor_state(set())
+        return
+
+    # Filter positions for system magic number if applicable
+    our_positions = [p for p in positions if getattr(p, 'magic', 0) == getattr(risk, 'MAGIC_NUMBER', getattr(p, 'magic', MAGIC_NUMBER))]
+    _cleanup_monitor_state({p.ticket for p in our_positions})
+
+    now = time.time()
+
+    for pos in our_positions:
+        sym_info = mt5.symbol_info(pos.symbol)
+        if not sym_info:
+            continue
+
+        # 1. Calculate true NET floating PnL (profit + swap + commission)
+        net_pnl = pos.profit + pos.swap + pos.commission
+        state = _get_or_init_monitor_state(pos.ticket)
+
+        # 2. Update High-Water Mark continuously
+        state["peak_pnl"] = max(state["peak_pnl"], net_pnl)
+
+        # 3. Update rolling 30-second history buffer
+        state["pnl_history"].append((now, net_pnl))
+        state["pnl_history"] = [entry for entry in state["pnl_history"] if (now - entry[0]) <= 30]
+
+        # 4. Evaluate dynamic exit conditions in strict priority order
+        hard_cap = risk.evaluate_hard_giveback_cap(state["peak_pnl"], net_pnl)
+        decline = risk.evaluate_decline_to_zero(state["pnl_history"])
+        giveback = risk.evaluate_giveback_exit(state["peak_pnl"], net_pnl)
+
+        if hard_cap["exit"] or decline["exit"] or giveback["exit"]:
+            exit_reason = hard_cap.get("reason") or decline.get("reason") or giveback.get("reason")
+            _close_position_market(pos, exit_reason, log)
+            continue
+
+        # 5. Evaluate and apply Server-Side Time-Decay TP adjustments
+        elapsed_seconds = now - pos.time
+        sl_distance = trade_sl_distances.get(pos.ticket, trade_sl_distances.get(pos.symbol))
+
+        if sl_distance:
+            new_tp = risk.calculate_time_decay_tp(
+                open_price=pos.price_open,
+                pos_type=pos.type,
+                sl_distance=sl_distance,
+                elapsed_seconds=elapsed_seconds,
+                digits=sym_info.digits
+            )
+            
+            # Update server TP if changed by more than 1 pip/point threshold
+            if abs(pos.tp - new_tp) >= (sym_info.point * 10):
+                modify_request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "symbol": pos.symbol,
+                    "sl": pos.sl,
+                    "tp": new_tp,
+                }
+                mt5.order_send(modify_request)
+                log.info(f"[{pos.symbol}] Updated Time-Decay TP to {new_tp} (Elapsed: {elapsed_seconds / 60:.1f}m)")
