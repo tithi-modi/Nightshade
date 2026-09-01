@@ -59,6 +59,17 @@ Changes vs v7:
   - Added evaluate_hard_giveback_cap(), evaluate_giveback_exit(), and evaluate_decline_to_zero() pure exit evaluation functions.
 """
 
+"""
+Nightshade Seed Engine - risk.py  v9  (Layer 3)
+
+Changes vs v8:
+  - Added calculate_dynamic_rr() helper to dynamically derive entry R:R from swing structure (clamped 1.2R–3.0R).
+  - Updated evaluate_risk() to accept swing levels (swing_high, swing_low) and tp_price_override.
+  - Added HARD_PROFIT_LOCK_EUR = 70.0 constant and evaluate_profit_lock_exit() priority #0 exit guard.
+  - Added BREAKEVEN_FEE_BUFFER_PIPS = 1.0 constant and updated calculate_ratchet_sl() with monetary & fee-inclusive breakeven triggers.
+  - Added price_for_profit() helper to compute explicit SL prices for monetary target floors.
+"""
+
 import MetaTrader5 as mt5
 import json
 import os
@@ -80,6 +91,10 @@ MAX_DAILY_TRADES           = 5    # hard cap on total trades per UTC day
 CIRCUIT_BREAKER_ACTIVE_KEY = "circuit_breaker_active"
 BASE_DIR                   = Path(__file__).resolve().parent
 STATE_FILE                 = BASE_DIR / "daily_state.json"
+
+# --- Hard Profit Lock & Breakeven Buffer ---
+HARD_PROFIT_LOCK_EUR      = 70.0  # Minimum absolute cash-out target floor
+BREAKEVEN_FEE_BUFFER_PIPS = 1.0   # Extra pips added to breakeven SL to cover spread/commission
 
 # --- Peak Giveback & Circuit Breaker Constants ---
 GIVEBACK_ACTIVATION_EUR = 50.0
@@ -566,6 +581,73 @@ def validate_broker_constraints(symbol: str, order_type, volume: float, price: f
 
 
 # ---------------------------------------------------------------------------
+# DYNAMIC TARGET & ABSOLUTE PROFIT LOCK HELPERS
+# ---------------------------------------------------------------------------
+
+def calculate_dynamic_rr(
+    current_price: float,
+    signal_type: str,
+    sl_distance: float,
+    swing_high: float = None,
+    swing_low: float = None
+) -> float:
+    """Calculates dynamic R:R based on recent chart structure (Swing High/Low) or ATR regime."""
+    if signal_type == "BUY" and swing_high and swing_high > current_price:
+        structure_dist = swing_high - current_price
+        calculated_rr = structure_dist / sl_distance
+    elif signal_type == "SELL" and swing_low and swing_low < current_price:
+        structure_dist = current_price - swing_low
+        calculated_rr = structure_dist / sl_distance
+    else:
+        calculated_rr = 2.0  # Default structure-free volatility target
+
+    # Clamp R:R between 1.2R (minimum viable) and 3.0R (realistic ceiling)
+    return max(1.2, min(3.0, calculated_rr))
+
+
+def evaluate_profit_lock_exit(net_pnl: float, peak_pnl: float) -> dict:
+    """
+    Priority #0 Exit Guard:
+    1. Instantly cashes out if floating PnL >= €70.
+    2. If peak profit previously crossed €70 and retraces back down to €70, closes immediately.
+    """
+    if net_pnl >= HARD_PROFIT_LOCK_EUR:
+        return {
+            "exit": True,
+            "reason": f"PROFIT LOCK HIT: Net PnL €{net_pnl:.2f} >= €{HARD_PROFIT_LOCK_EUR:.2f}. Cashing out."
+        }
+
+    if peak_pnl >= HARD_PROFIT_LOCK_EUR and net_pnl < HARD_PROFIT_LOCK_EUR:
+        return {
+            "exit": True,
+            "reason": f"PROFIT FLOOR GUARD: Peak reached €{peak_pnl:.2f}. Retraced to €{net_pnl:.2f}. Locking in €70 floor."
+        }
+
+    return {"exit": False}
+
+
+def price_for_profit(symbol: str, pos_type: int, volume: float, current_price: float, profit_amount: float) -> float | None:
+    """Returns the SL price that would result in exactly profit_amount (positive) for given position."""
+    account = mt5.account_info()
+    if account is None:
+        return None
+    pip_val = _get_pip_value_per_lot(symbol, account.currency)
+    if pip_val is None or pip_val <= 0:
+        return None
+    sym_info = mt5.symbol_info(symbol)
+    if sym_info is None or sym_info.point <= 0:
+        return None
+
+    pips = profit_amount / (volume * pip_val)
+    price_diff = pips * (sym_info.point * 10.0)
+
+    if pos_type == 0:  # BUY
+        return current_price - price_diff
+    else:              # SELL
+        return current_price + price_diff
+
+
+# ---------------------------------------------------------------------------
 # RATCHET SL CALCULATION & EXIT RULES
 # ---------------------------------------------------------------------------
 
@@ -574,11 +656,13 @@ def calculate_ratchet_sl(
     open_price: float,
     current_sl: float,
     current_price: float,
-    sl_distance: float
+    sl_distance: float,
+    net_pnl: float = 0.0,
+    point_value: float = 0.0001
 ) -> float | None:
     """
-    Evaluates unrealized R-multiple profit and returns target ratchet SL price.
-    Returns None if no step threshold is crossed or target SL isn't an improvement.
+    Evaluates unrealized profit and returns target ratchet SL price.
+    Triggers Breakeven (+ fee buffer) if trade hits +0.5R OR floating profit >= €35.
     """
     if sl_distance <= 0:
         return None
@@ -587,26 +671,31 @@ def calculate_ratchet_sl(
     profit_dist = (current_price - open_price) if pos_type == 0 else (open_price - current_price)
     r_multiple = profit_dist / sl_distance
 
-    # Map R-multiple thresholds to locked R distances
-    target_r = None
-    if r_multiple >= 3.0:
-        target_r = 2.0  # +2.0R distance
-    elif r_multiple >= 2.0:
-        target_r = 1.0  # +1.0R distance
-    elif r_multiple >= 1.0:
-        target_r = 0.5  # +0.5R distance
-    elif r_multiple >= 0.5:
-        target_r = 0.0  # Breakeven
+    # Calculate fee-adjusted breakeven offset
+    fee_offset = BREAKEVEN_FEE_BUFFER_PIPS * (point_value * 10.0)
 
-    if target_r is None:
+    # Determine locked R or Breakeven trigger
+    target_sl = None
+
+    if r_multiple >= 3.0:
+        target_r_dist = 2.0 * sl_distance
+        target_sl = (open_price + target_r_dist) if pos_type == 0 else (open_price - target_r_dist)
+    elif r_multiple >= 2.0:
+        target_r_dist = 1.0 * sl_distance
+        target_sl = (open_price + target_r_dist) if pos_type == 0 else (open_price - target_r_dist)
+    elif r_multiple >= 1.0:
+        target_r_dist = 0.5 * sl_distance
+        target_sl = (open_price + target_r_dist) if pos_type == 0 else (open_price - target_r_dist)
+    elif r_multiple >= 0.5 or net_pnl >= 35.0:  # Breakeven condition
+        target_sl = (open_price + fee_offset) if pos_type == 0 else (open_price - fee_offset)
+
+    if target_sl is None:
         return None
 
-    # Convert locked R into concrete target SL price
+    # Only apply if target SL is better than current SL
     if pos_type == 0:  # BUY
-        target_sl = open_price + (target_r * sl_distance)
         return target_sl if target_sl > current_sl else None
     else:              # SELL
-        target_sl = open_price - (target_r * sl_distance)
         return target_sl if (current_sl == 0.0 or target_sl < current_sl) else None
 
 
@@ -683,12 +772,15 @@ def evaluate_decline_to_zero(pnl_history: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def evaluate_risk(
-    signal_type:   str,
-    current_price: float,
-    atr_val:       float,
-    risk_pct:      float = 1.0,
-    rr_ratio:      float = 1.5,
-    symbol:        str   = "EURUSD",
+    signal_type:       str,
+    current_price:     float,
+    atr_val:           float,
+    risk_pct:          float = 1.0,
+    rr_ratio:          float = 1.5,
+    symbol:            str   = "EURUSD",
+    swing_high:        float = None,
+    swing_low:         float = None,
+    tp_price_override: float = None,
 ) -> dict:
     """Evaluates whether a trade should be taken and computes exact parameters."""
 
@@ -735,14 +827,24 @@ def evaluate_risk(
     if sl_pips < 1.0:
         return reject(f"SL {sl_pips:.2f} pips too small — spread risk.")
 
+    # Calculate initial SL price
     if signal_type == "BUY":
         sl_price = round(current_price - sl_distance, digits)
-        tp_price = round(current_price + sl_distance * rr_ratio, digits)
         order_type = mt5.ORDER_TYPE_BUY
     else:
         sl_price = round(current_price + sl_distance, digits)
-        tp_price = round(current_price - sl_distance * rr_ratio, digits)
         order_type = mt5.ORDER_TYPE_SELL
+
+    # Determine dynamic or overridden TP placement
+    if tp_price_override is not None:
+        tp_price = round(tp_price_override, digits)
+        effective_rr = abs(tp_price - current_price) / sl_distance if sl_distance > 0 else rr_ratio
+    else:
+        effective_rr = calculate_dynamic_rr(current_price, signal_type, sl_distance, swing_high, swing_low)
+        if signal_type == "BUY":
+            tp_price = round(current_price + (sl_distance * effective_rr), digits)
+        else:
+            tp_price = round(current_price - (sl_distance * effective_rr), digits)
 
     risk_amount = equity * (risk_pct / 100.0)
     loss_per_lot = _broker_estimated_loss(symbol, order_type, 1.0, current_price, sl_price)
@@ -768,7 +870,7 @@ def evaluate_risk(
 
     log.info(
         f"Risk APPROVED [{symbol}] | {signal_type} {lot_size} lots | "
-        f"Entry: {current_price:.{digits}f} | SL: {sl_price:.{digits}f} | TP: {tp_price:.{digits}f} | "
+        f"Entry: {current_price:.{digits}f} | SL: {sl_price:.{digits}f} | TP: {tp_price:.{digits}f} (R:R {effective_rr:.2f}) | "
         f"Risk: {risk_amount:.2f} {account_currency} ({risk_pct}%) | SL pips: {sl_pips:.1f} | "
         f"{get_streak_status()}"
     )
@@ -785,6 +887,6 @@ def evaluate_risk(
         "risk_amount":   round(abs(actual_loss), 2),
         "sl_pips":       round(sl_pips, 1),
         "sl_distance":   sl_distance,
-        "rr_ratio":      rr_ratio,
+        "rr_ratio":      round(effective_rr, 2),
         "reject_reason": None,
     }

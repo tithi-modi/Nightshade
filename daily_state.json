@@ -1,19 +1,14 @@
 {
-  "date": "2026-08-27",
-  "start_equity": 10023.47,
-  "trades_today": 2,
-  "consecutive_losses": 0,
-  "last_trade_result": "win",
-  "circuit_breaker_active": false,
-  "last_evaluated": {
-    "EURUSD": "2026-08-27T15:15:00",
-    "GBPUSD": "2026-08-27T15:15:00",
-    "USDJPY": "2026-08-27T15:15:00",
-    "AUDUSD": "2026-08-27T15:15:00"
-  },
+  "date": "2026-09-01",
+  "start_equity": 10099.08,
+  "trades_today": 3,
+  "consecutive_losses": 3,
+  "last_trade_result": "loss",
+  "circuit_breaker_active": true,
+  "last_evaluated": {},
   "processed_deal_tickets": [
-    1520938167,
-    1521196782,
-    1521620390
+    1529199193,
+    1529248377,
+    1529267464
   ]
 }
