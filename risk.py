@@ -70,6 +70,17 @@ Changes vs v8:
   - Added price_for_profit() helper to compute explicit SL prices for monetary target floors.
 """
 
+"""
+Nightshade Seed Engine - risk.py  v10  (Layer 3)
+
+Changes vs v9:
+  - Removed evaluate_decline_to_zero() trend decline function.
+  - Replaced legacy peak giveback thresholds with Three-Tier Exit Architecture constants.
+  - Added evaluate_trailing_profit_lock() for Tier 1 green trade profit retention (activates at >= €0.30).
+  - Added evaluate_hard_loss_cap() for Tier 2 red trade instant loss containment (floor at <= -€15.00).
+  - Added evaluate_stagnation_exit() for Tier 3 flat trade time-decay exit (30 min timeout near breakeven).
+"""
+
 import MetaTrader5 as mt5
 import json
 import os
@@ -96,15 +107,12 @@ STATE_FILE                 = BASE_DIR / "daily_state.json"
 HARD_PROFIT_LOCK_EUR      = 70.0  # Minimum absolute cash-out target floor
 BREAKEVEN_FEE_BUFFER_PIPS = 1.0   # Extra pips added to breakeven SL to cover spread/commission
 
-# --- Peak Giveback & Circuit Breaker Constants ---
-GIVEBACK_ACTIVATION_EUR = 50.0
-GIVEBACK_TIERS = [
-    (100.0, 0.40),         # Peak €50 - €100  -> allow 40% give-back
-    (200.0, 0.25),         # Peak €100 - €200 -> allow 25% give-back
-    (float("inf"), 0.10),  # Peak > €200      -> allow 10% give-back
-]
-HARD_GIVEBACK_CAP_PCT = 0.50  # Hard circuit breaker: trigger if PnL retraces >= 50% AND < €0
-DECLINE_NOISE_TOLERANCE = 0.05 # €0.05 noise tolerance for trend detection
+# --- Three-Tier Exit Architecture Constants ---
+TIER1_TRAILING_ACTIVATION_EUR = 0.30   # Tier 1: Activates when net PnL >= €0.30
+TIER1_TRAILING_BUFFER_EUR     = 0.15   # Trailing buffer distance below peak PnL
+TIER2_HARD_LOSS_CAP_EUR       = -15.0  # Tier 2: Instant market exit if PnL <= -€15.00
+TIER3_STAGNATION_TIMEOUT_SEC  = 1800   # Tier 3: 30 minutes timeout
+TIER3_STAGNATION_BAND_EUR     = 2.00   # Flat PnL range [-€2.00, +€2.00]
 
 # --- Time-Decay TP Schedules ---
 TIME_DECAY_TP_R = [
@@ -717,53 +725,35 @@ def calculate_time_decay_tp(open_price: float, pos_type: int, sl_distance: float
     return round(raw_tp, digits)
 
 
-def evaluate_hard_giveback_cap(peak_pnl: float, current_pnl: float) -> dict:
-    """Circuit Breaker: Forces exit if trade loses >= 50% of peak AND drops into negative territory."""
-    if peak_pnl >= GIVEBACK_ACTIVATION_EUR and current_pnl < 0:
-        retrace_pct = (peak_pnl - current_pnl) / peak_pnl
-        if retrace_pct >= HARD_GIVEBACK_CAP_PCT:
+def evaluate_trailing_profit_lock(peak_pnl: float, current_pnl: float) -> dict:
+    """Tier 1: Trailing Profit Lock for Green Trades (activates at >= €0.30)."""
+    if peak_pnl >= TIER1_TRAILING_ACTIVATION_EUR:
+        target_exit_pnl = peak_pnl - TIER1_TRAILING_BUFFER_EUR
+        if current_pnl <= target_exit_pnl:
             return {
-                "exit": True, 
-                "reason": f"HARD CAP: Retraced {retrace_pct * 100:.1f}% off peak €{peak_pnl:.2f} (Current: €{current_pnl:.2f})"
+                "exit": True,
+                "reason": f"Tier 1 Trailing Lock: Net PnL €{current_pnl:.2f} <= exit threshold €{target_exit_pnl:.2f} (Peak: €{peak_pnl:.2f})"
             }
     return {"exit": False}
 
 
-def evaluate_giveback_exit(peak_pnl: float, current_pnl: float) -> dict:
-    """Tiered high-water mark lock with non-negative (€0.00) floor guard."""
-    if peak_pnl < GIVEBACK_ACTIVATION_EUR:
-        return {"exit": False}
-
-    allowed_pct = 0.40
-    for ceiling, pct in GIVEBACK_TIERS:
-        if peak_pnl <= ceiling:
-            allowed_pct = pct
-            break
-
-    target_exit_pnl = max(0.0, peak_pnl * (1.0 - allowed_pct))
-    
-    if current_pnl <= target_exit_pnl:
+def evaluate_hard_loss_cap(current_pnl: float) -> dict:
+    """Tier 2: Hard Loss Cap for Red Trades (exits immediately if loss <= -€15.00)."""
+    if current_pnl <= TIER2_HARD_LOSS_CAP_EUR:
         return {
             "exit": True,
-            "reason": f"Tiered Exit: Target €{target_exit_pnl:.2f} hit off peak €{peak_pnl:.2f} ({allowed_pct * 100:.0f}% allowed give-back)"
+            "reason": f"Tier 2 Hard Loss Cap: Net PnL €{current_pnl:.2f} <= -€15.00 floor."
         }
     return {"exit": False}
 
 
-def evaluate_decline_to_zero(pnl_history: list) -> dict:
-    """Triggers exit if PnL shows a stable downward trend and crosses into <= €0."""
-    if len(pnl_history) < 4:
-        return {"exit": False}
-
-    recent = [p[1] for p in pnl_history[-4:]]
-    is_declining = all(
-        recent[i + 1] <= (recent[i] + DECLINE_NOISE_TOLERANCE)
-        for i in range(len(recent) - 1)
-    )
-    crossed_zero = recent[-2] > 0 and recent[-1] <= 0
-
-    if is_declining and crossed_zero:
-        return {"exit": True, "reason": "30s Trend Decay: Steady decline crossed zero threshold."}
+def evaluate_stagnation_exit(current_pnl: float, elapsed_seconds: float) -> dict:
+    """Tier 3: Time-Based Stagnation Exit for Flat Trades (30 min timeout near breakeven)."""
+    if elapsed_seconds >= TIER3_STAGNATION_TIMEOUT_SEC and (-TIER3_STAGNATION_BAND_EUR <= current_pnl <= TIER3_STAGNATION_BAND_EUR):
+        return {
+            "exit": True,
+            "reason": f"Tier 3 Stagnation Exit: Trade flat at €{current_pnl:.2f} for {elapsed_seconds / 60:.1f} mins."
+        }
     return {"exit": False}
 
 
