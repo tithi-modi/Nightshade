@@ -1,6 +1,7 @@
 # NightshadE
 ### Currently this repository has only one bot, but will hold multiple bots that run on different strategies in the future.
 
+# Bot 1
 **Mean-Reversion Trading Bot for MetaTrader 5**
 
 Nightshade is a fully automated trading bot designed for the MetaTrader 5 platform. It implements a **mean-reversion strategy** using Bollinger Bands® and ATR regime filters, enhanced with **dynamic position management** (ratchet stop‑loss, time‑decay take‑profit, high‑water mark giveback protection) and **portfolio‑aware risk allocation**. Built for robustness, it survives restarts, partial fills, and broker disconnects.
