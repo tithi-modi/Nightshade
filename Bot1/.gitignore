@@ -1,0 +1,14 @@
+# Nightshade runtime state
+daily_state.json
+position_state.json
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Lock file
+nightshade.lock
